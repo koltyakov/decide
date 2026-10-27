@@ -1,0 +1,23 @@
+{
+  "state": {"photo": "image-7f92944a-photo"},
+  "questions": {
+    "person_present": {
+      "type": "noul",
+      "instructions": "Is there a person in photo?"
+    },
+    "person_box": {
+      "type": "box",
+      "instructions": "The person nearest the door in photo."
+    },
+    "carrying": {
+      "type": "choice",
+      "instructions": "What is the person in photo carrying?",
+      "criteria": {
+        "package": "A box or parcel",
+        "bag": "A bag of groceries or shopping",
+        "nothing": "Empty hands",
+        "review": "No person, unclear, or another object"
+      }
+    }
+  }
+}

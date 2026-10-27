@@ -1,0 +1,29 @@
+{
+  "state": {
+    "message": "The payment integration has failed for three days. Please fix it today."
+  },
+  "questions": {
+    "urgent": {
+      "type": "noul",
+      "instructions": "Does message require a reply today?",
+      "criteria": {
+        "true": "A current issue needing same-day attention.",
+        "false": "A resolved issue or non-urgent request."
+      }
+    },
+    "team": {
+      "type": "choice",
+      "instructions": {"task": "Choose the team that should handle message."},
+      "criteria": {
+        "billing": {"description": "Invoices, charges, or refunds", "excludes": "Integration bugs"},
+        "technical": "Bugs and integration failures",
+        "review": "Unclear or outside these teams"
+      }
+    },
+    "severity": {
+      "type": "score",
+      "instructions": "How severe is the incident described in message?",
+      "criteria": ["No service impact", "Partial outage", "Full outage"]
+    }
+  }
+}
