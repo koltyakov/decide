@@ -60,7 +60,7 @@ cosign verify-blob --bundle checksums.txt.sigstore.json \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com checksums.txt
 ```
 
-To uninstall, run `scripts/uninstall.sh` or `scripts/uninstall.ps1` (the PowerShell script also removes the `PATH` entry), or `make uninstall` for a `go install` build. Uninstalling keeps saved credentials, MCP entries, and skills; remove those by hand.
+To uninstall, run `scripts/uninstall.sh` or `scripts/uninstall.ps1` (the PowerShell script also removes the `PATH` entry); `make uninstall` runs the one for your platform. A `go install` build lives in `GOBIN`; remove it there. Uninstalling keeps saved credentials, MCP entries, and skills; remove those by hand.
 
 ## Connect a provider
 
@@ -141,7 +141,7 @@ make lint
 make check
 ```
 
-`make build` produces `bin/decide`; `make install` installs only the CLI. Tests use local fake APIs, never live credentials. `make release-local` builds and verifies six platform bundles; `make ci` runs the full local CI checks. See `make help` and the [contributor guide](AGENTS.md).
+`make build` produces `bin/decide`; `make install` builds it and runs `bin/decide install-self --refresh-skills`, which copies the binary to the installers' location (`DECIDE_INSTALL_DIR`, `~/.local/bin`, or `%LOCALAPPDATA%\Programs\decide` with a user `PATH` entry) and refreshes existing managed skills. An existing destination is never executed: identical bytes are reused, and other files are replaced only when their Go build metadata identifies `decide`. `make uninstall` runs the platform uninstall script. Tests use local fake APIs, never live credentials. `make release-local` builds and verifies six platform bundles; `make ci` runs the full local CI checks. See `make help` and the [contributor guide](AGENTS.md).
 
 ## Documentation
 

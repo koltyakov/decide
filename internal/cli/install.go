@@ -10,6 +10,44 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// installSelf copies the running executable to the per-user install location
+// shared with the release installers.
+func (a *app) installSelf() *cobra.Command {
+	var refresh bool
+	cmd := &cobra.Command{
+		Use: "install-self", Short: "Install this executable to the per-user location used by the release installers", Args: noArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			source, err := os.Executable()
+			if err != nil {
+				return err
+			}
+			dest, err := installation.BinaryPath()
+			if err != nil {
+				return err
+			}
+			result, err := installation.InstallSelf(cmd.Context(), source, dest, installation.MainPackage)
+			if err != nil {
+				return err
+			}
+			output := map[string]any{"ok": true, "path": result.Path, "changed": result.Changed, "path_added": result.PathAdded, "on_path": result.OnPath}
+			if refresh {
+				home, err := os.UserHomeDir()
+				if err != nil {
+					return err
+				}
+				refreshed, err := installation.RefreshSkills(home, "")
+				if err != nil {
+					return err
+				}
+				output["refreshed"] = refreshed
+			}
+			return a.print(output)
+		},
+	}
+	cmd.Flags().BoolVar(&refresh, "refresh-skills", false, "also update existing global decide-managed skills; never creates new ones")
+	return cmd
+}
+
 func (a *app) install(command string) *cobra.Command {
 	var project string
 	var refresh bool

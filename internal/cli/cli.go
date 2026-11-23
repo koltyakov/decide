@@ -58,7 +58,7 @@ func New(version string, in io.Reader, out, diagnostic io.Writer) *cobra.Command
 	for _, kind := range []string{"noul", "choice", "score", "box"} {
 		root.AddCommand(a.decision(kind))
 	}
-	root.AddCommand(a.systemOne(), a.batch(), a.providers(), a.install("install-mcp"), a.install("install-skill"), a.versionCommand())
+	root.AddCommand(a.systemOne(), a.batch(), a.providers(), a.install("install-mcp"), a.install("install-skill"), a.installSelf(), a.versionCommand())
 	root.AddCommand(&cobra.Command{
 		Use: "models", Short: "List the selected provider's native model catalog", Args: noArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {

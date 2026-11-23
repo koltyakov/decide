@@ -22,8 +22,8 @@ help:
 	@echo "make test / test-race     Run native tests / race detector"
 	@echo "make check                Vet and race tests"
 	@echo "make cov / bench          Generate coverage HTML / run benchmarks"
-	@echo "make build / install      Build bin/decide / install decide to GOBIN"
-	@echo "make uninstall            Remove decide from GOBIN; keeps credentials and integrations"
+	@echo "make build / install      Build bin/decide / install it and refresh managed skills"
+	@echo "make uninstall            Run the per-user uninstaller; keeps credentials and integrations"
 	@echo "make bundle / build-all   Build six platform binaries and checksums"
 	@echo "make release-local        Build and verify a release bundle"
 	@echo "make release-check        Verify the existing release bundle"
@@ -75,12 +75,15 @@ bench:
 build:
 	$(GO) run ./cmd/decide-bundle --binary "$(BIN_DIR)/decide$(EXE)" --version "$(VERSION)"
 
-install:
-	CGO_ENABLED=0 $(GO) install -trimpath -ldflags '-s -w -X main.version=$(VERSION)' ./cmd/decide
+install: build
+	"$(BIN_DIR)/decide$(EXE)" install-self --refresh-skills
 
 uninstall:
-	@bin="$$($(GO) env GOBIN)"; [ -n "$$bin" ] || bin="$$($(GO) env GOPATH)/bin"; \
-	rm -f "$$bin/decide" "$$bin/decide.exe"; echo "Removed decide from $$bin"
+ifeq ($(OS),Windows_NT)
+	powershell -NoProfile -ExecutionPolicy Bypass -File scripts/uninstall.ps1
+else
+	sh scripts/uninstall.sh
+endif
 
 bundle:
 	$(GO) run ./cmd/decide-bundle --out "$(DIST_DIR)" --platforms "$(PLATFORMS)" --version "$(VERSION)"
