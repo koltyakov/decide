@@ -16,7 +16,11 @@ import (
 	"github.com/koltyakov/decide/internal/fault"
 )
 
-const MaxImageBytes = 16 << 20
+const (
+	MaxImageBytes = 16 << 20
+	// MaxAssets bounds reference scanning and expansion work per request.
+	MaxAssets = 256
+)
 
 type Attachment struct {
 	Reference string
@@ -24,21 +28,35 @@ type Attachment struct {
 	Data      []byte
 }
 
+type imageInfo struct {
+	format        string
+	width, height int
+}
+
+// imageRules carries provider-specific image limits checked during preparation.
+type imageRules struct {
+	inline             bool
+	minimum, minPixels int
+}
+
+// LoadImage reads bounded bytes and checks format, dimensions, and animation.
+// Pixel decoding happens once, during request preparation.
 func LoadImage(reference string, r io.Reader) (Attachment, error) {
 	b, err := io.ReadAll(io.LimitReader(r, MaxImageBytes+1))
 	if err != nil {
 		return Attachment{}, fault.New(fault.Usage, "cannot read image")
 	}
 	// Provider-specific minimum dimensions are checked during request preparation.
-	format, err := imageFormat(b, 256)
+	info, err := imageHeader(b, 256)
 	if err != nil {
 		return Attachment{}, err
 	}
-	return Attachment{Reference: reference, Format: format, Data: b}, nil
+	return Attachment{Reference: reference, Format: info.format, Data: b}, nil
 }
 
-func imageFormat(b []byte, minimum int) (string, error) {
-	bad := func(message string) (string, error) { return "", fault.New(fault.Usage, message) }
+// imageHeader validates everything except pixel data.
+func imageHeader(b []byte, minimum int) (imageInfo, error) {
+	bad := func(message string) (imageInfo, error) { return imageInfo{}, fault.New(fault.Usage, message) }
 	if len(b) > MaxImageBytes {
 		return bad("image exceeds 16 MiB")
 	}
@@ -62,114 +80,110 @@ func imageFormat(b []byte, minimum int) (string, error) {
 			pos += int(size) + 12
 		}
 	}
-	if _, _, err := image.Decode(bytes.NewReader(b)); err != nil {
-		return bad("image is damaged or incomplete; re-export as PNG or JPEG")
-	}
-	return format, nil
+	return imageInfo{format: format, width: config.Width, height: config.Height}, nil
 }
 
-// prepareAssets validates inline assets and binds explicit file attachments.
+// checkImage applies every image rule, including one full pixel decode.
+func checkImage(b []byte, rules imageRules) (imageInfo, error) {
+	info, err := imageHeader(b, rules.minimum)
+	if err != nil {
+		return info, err
+	}
+	if info.width*info.height < rules.minPixels {
+		return info, fault.New(fault.Usage, "OpenRouter Jev images require at least 78,400 pixels in total")
+	}
+	if _, _, err := image.Decode(bytes.NewReader(b)); err != nil {
+		return info, fault.New(fault.Usage, "image is damaged or incomplete; re-export as PNG or JPEG")
+	}
+	return info, nil
+}
+
+// bindAssets validates inline assets, binds explicit file attachments, and
+// returns each reference's detected format. Every image is decoded exactly once.
 // It never interprets asset strings as filesystem paths.
-func prepareAssets(request Object, attachments []Attachment, inline bool, minimum int) error {
+func bindAssets(request Object, attachments []Attachment, rules imageRules) (map[string]string, error) {
 	assets, ok := request["assets"].(map[string]any)
 	if _, exists := request["assets"]; exists && (!ok || len(assets) == 0) {
-		return fault.New(fault.Usage, "assets must be a non-empty object")
+		return nil, fault.New(fault.Usage, "assets must be a non-empty object")
+	}
+	if len(assets)+len(attachments) > MaxAssets {
+		return nil, fault.New(fault.Usage, "a request can contain at most "+strconv.Itoa(MaxAssets)+" image assets")
 	}
 	if assets == nil {
 		assets = map[string]any{}
 	}
+	formats := map[string]string{}
 	parts := map[string]bool{}
 	for i, attachment := range attachments {
 		if _, exists := assets[attachment.Reference]; exists {
-			return fault.New(fault.Usage, "attachment conflicts with an existing asset reference")
+			return nil, fault.New(fault.Usage, "attachment conflicts with an existing asset reference")
 		}
 		// Recheck so callers cannot bypass limits by constructing Attachment directly.
-		format, err := imageFormat(attachment.Data, minimum)
+		info, err := checkImage(attachment.Data, rules)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		if inline {
-			assets[attachment.Reference] = Object{"type": "image", "format": format, "data_base64": base64.StdEncoding.EncodeToString(attachment.Data)}
+		formats[attachment.Reference] = info.format
+		if rules.inline {
+			assets[attachment.Reference] = Object{"type": "image", "format": info.format, "data_base64": base64.StdEncoding.EncodeToString(attachment.Data)}
 		} else {
 			part := "image-" + strconv.Itoa(i)
 			parts[part] = true
-			assets[attachment.Reference] = Object{"type": "image", "part": part, "format": format}
+			assets[attachment.Reference] = Object{"type": "image", "part": part, "format": info.format}
 		}
 	}
 	refBytes := 0
 	for ref, value := range assets {
 		refBytes += len(ref)
 		if strings.TrimSpace(ref) == "" || len(ref) > 1024 || refBytes > 65536 {
-			return fault.New(fault.Usage, "asset references exceed length limits")
+			return nil, fault.New(fault.Usage, "asset references exceed length limits")
 		}
 		asset, ok := value.(map[string]any)
 		if !ok || (asset["type"] != nil && asset["type"] != "image") {
-			return fault.New(fault.Usage, "asset must be an image object")
-		}
-		if !referenced(request["state"], ref) && !questionReference(request["questions"], ref) {
-			return fault.New(fault.Usage, "every asset must be referenced in state, instructions, or criteria")
+			return nil, fault.New(fault.Usage, "asset must be an image object")
 		}
 		if part, exists := asset["part"]; exists {
 			name, ok := part.(string)
 			if !ok || !parts[name] {
-				return fault.New(fault.Usage, "multipart asset has no CLI image attachment; use inline data_base64 in JSON")
+				return nil, fault.New(fault.Usage, "multipart asset has no CLI image attachment; use inline data_base64 in JSON")
 			}
 			delete(parts, name)
 			continue
 		}
+		if _, done := formats[ref]; done {
+			continue // Built above from an attachment that was already decoded.
+		}
 		format, _ := asset["format"].(string)
 		encoded, ok := asset["data_base64"].(string)
 		if !ok || (format != "png" && format != "jpeg" && format != "jpg") || strings.ContainsAny(encoded, "\r\n\t ") || len(encoded) > base64.StdEncoding.EncodedLen(MaxImageBytes) {
-			return fault.New(fault.Usage, "inline image requires png/jpg/jpeg format and standard padded data_base64")
+			return nil, fault.New(fault.Usage, "inline image requires png/jpg/jpeg format and standard padded data_base64")
 		}
 		data, err := base64.StdEncoding.Strict().DecodeString(encoded)
 		if err != nil {
-			return fault.New(fault.Usage, "invalid image base64")
+			return nil, fault.New(fault.Usage, "invalid image base64")
 		}
-		if _, err = imageFormat(data, minimum); err != nil {
-			return err
+		info, err := checkImage(data, rules)
+		if err != nil {
+			return nil, err
 		}
+		formats[ref] = info.format
 	}
 	if len(assets) > 0 {
 		request["assets"] = assets
 	}
-	return nil
-}
-
-func questionReference(value any, ref string) bool {
-	questions, _ := value.(map[string]any)
-	for _, v := range questions {
-		q, _ := v.(map[string]any)
-		if referenced(q["instructions"], ref) || referenced(q["criteria"], ref) {
-			return true
-		}
-	}
-	return false
-}
-
-func referenced(value any, ref string) bool {
-	switch v := value.(type) {
-	case string:
-		return strings.Contains(v, ref)
-	case []any:
-		for _, item := range v {
-			if referenced(item, ref) {
-				return true
-			}
-		}
-	case map[string]any:
-		for _, item := range v {
-			if referenced(item, ref) {
-				return true
-			}
-		}
-	}
-	return false
+	return formats, nil
 }
 
 // multipartBody writes bounded uploads without an unowned pipe goroutine.
 func multipartBody(request []byte, attachments []Attachment) ([]byte, string, error) {
 	var b bytes.Buffer
+	size := len(request) + 1024
+	for _, attachment := range attachments {
+		size += len(attachment.Data) + 1024
+	}
+	if size <= MaxBytes {
+		b.Grow(size)
+	}
 	w := multipart.NewWriter(&b)
 	header := textproto.MIMEHeader{}
 	header.Set("Content-Disposition", `form-data; name="request"`)

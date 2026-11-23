@@ -1,6 +1,6 @@
 # Providers and Jev versions
 
-Contracts and version references checked on October 26, 2026. The current official stable Jev release is **1.14.0**, released October 14, 2026. Image input and Box remain experimental. Newest model availability and feature availability are separate facts: an API gateway can expose Jev 1.14 without exposing every TypeSafe request feature.
+Contracts and version references checked on October 26, 2026. TypeSafe's own docs were rechecked on November 23, 2026, with no newer release or contract change. The current official stable Jev release is **1.14.0**, released October 14, 2026. Image input and Box remain experimental. Newest model availability and feature availability are separate facts: an API gateway can expose Jev 1.14 without exposing every TypeSafe request feature.
 
 ## Version policy
 
@@ -89,7 +89,7 @@ Sources: [Jev 1.14 API](https://docs.aimlapi.com/api-references/decision-models/
 
 Provider: `openrouter`. Endpoint: `https://openrouter.ai/api/alpha/decisions`. Default: `~typesafe/jev-latest`; stable pin: `typesafe/jev-1.14`. Key: `OPENROUTER_API_KEY`.
 
-TypeSafe-style `assets` are currently ignored by the Decisions API. The CLI therefore replaces each referenced image with OpenRouter's native `image_url` part and removes the asset map. Replacement works in state, structured instructions, and criterion values. A reference embedded in a string becomes an array of text/image parts in reading order. Whole-string references take precedence; object keys are never replaced.
+TypeSafe-style `assets` are currently ignored by the Decisions API. The CLI therefore replaces each referenced image with OpenRouter's native `image_url` part and removes the asset map. Replacement works in state, structured instructions, and criterion values. A reference embedded in a string becomes an array of text/image parts in reading order. References match only as whole tokens: a reference whose edge is a letter, digit, `_`, or `-` doesn't match next to another such character, so `photo` is not replaced inside `photography`. At one position the longest reference wins. Whole-string references take precedence; object keys are never replaced. Each asset is validated and decoded once during preparation, including the 78,400-pixel minimum.
 
 Direct native parts in state/instructions/criteria are supported too. They must contain inline PNG/JPEG data URLs; remote URLs are rejected and never fetched. Native parts cannot bypass opt-in, image validation, dimensions, or byte limits. Each occurrence counts toward a bounded image-reference expansion budget before encoding, so a repeated large image cannot create unbounded output.
 

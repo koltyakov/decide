@@ -100,6 +100,28 @@ func TestMCPToolsWithRealProtocol(t *testing.T) {
 	if response["_decide"].(map[string]any)["gate"].(map[string]any)["passed"] != false || response["answers"] == nil {
 		t.Fatal("native response or gate metadata missing")
 	}
+	result, err = cs.CallTool(ctx, &mcp.CallToolParams{Name: "systemone", Arguments: jev.Object{"request": jev.Object{"state": "x", "questions": jev.Object{
+		"risk": jev.Object{"type": "noul"}, "team": jev.Object{"type": "choice", "criteria": jev.Object{"a": "A", "b": "B"}},
+	}}, "policy": []any{jev.Object{"answer": "risk", "atMost": 0.9}, jev.Object{"answer": "team", "is": []any{"a", "b"}}}}})
+	if err != nil || result.IsError {
+		t.Fatalf("policy array rejected: %v %v", result, err)
+	}
+	response = jev.Object{}
+	if err = json.Unmarshal([]byte(result.Content[0].(*mcp.TextContent).Text), &response); err != nil {
+		t.Fatal(err)
+	}
+	if meta := response["_decide"].(map[string]any); meta["passed"] != true || len(meta["gates"].([]any)) != 2 {
+		t.Fatal("multiple gates missing", meta)
+	}
+	result, err = cs.CallTool(ctx, &mcp.CallToolParams{Name: "noul", Arguments: jev.Object{"state": "x", "instructions": "Q?", "policy": jev.Object{"atleast": 0.9}}})
+	if err == nil && !result.IsError {
+		t.Fatal("misspelled policy rule accepted")
+	}
+	png := base64.StdEncoding.EncodeToString(testutil.PNG(t, 280, 280))
+	result, err = cs.CallTool(ctx, &mcp.CallToolParams{Name: "box", Arguments: jev.Object{"state": "photo-ref", "instructions": "Find mug", "dryRun": true, "assets": jev.Object{"photo-ref": jev.Object{"format": "png", "data_base64": png}}}})
+	if err != nil || result.IsError || strings.Contains(result.Content[0].(*mcp.TextContent).Text, png) || !strings.Contains(result.Content[0].(*mcp.TextContent).Text, "omitted") {
+		t.Fatalf("MCP preview echoed image bytes: %v", err)
+	}
 	before = calls.Load()
 	result, err = cs.CallTool(ctx, &mcp.CallToolParams{Name: "noul", Arguments: jev.Object{"state": "x", "instructions": "Q?", "dryRun": true}})
 	if err != nil || result.IsError || calls.Load() != before {

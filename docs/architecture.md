@@ -16,9 +16,11 @@
 
 ## Request flow
 
-CLI and MCP call `decision.Evaluate`. It resolves connection defaults, calls `jev.Prepare`, and validates the policy. Preparation copies the request, validates native questions, binds assets, translates provider-specific contracts, and encodes the bounded body. It does not require a key or contact the API.
+CLI and MCP call `decision.Evaluate`. It resolves connection defaults, calls `jev.Prepare`, and passes the result to `decision.Run`, which validates the policies. Preparation copies the request, validates native questions, binds assets, translates provider-specific contracts, and encodes the bounded body. It does not require a key or contact the API.
 
-A dry run returns a preview from this prepared request. Execution loads the selected key and calls `Client.Execute` once. Response validation rejects missing decisions, invalid primitive values, unknown Choice keys, and malformed boxes. The workflow layer adds `_decide` metadata only when a policy was explicitly requested; it does not rename API answers.
+`jev.Prepare` is built on `jev.Recipe`, which holds everything except state. A recipe validates questions and provider rules, binds and decodes each image once, and records which asset references its questions already contain. `Recipe.Prepare` and `PrepareJSON` then validate one state, check the remaining references, translate, and encode. Translation copies only the containers it changes, so a recipe is immutable and batch records share it concurrently. Asset references match as whole tokens, and a request has at most 256 assets.
+
+A dry run returns a preview from this prepared request; the summary mode replaces inline image bytes with their size. Execution loads the selected key and calls `Client.Execute` once. Response validation rejects missing decisions, invalid primitive values, unknown Choice keys, and malformed boxes. The workflow layer adds `_decide` metadata only when a policy was explicitly requested; it does not rename API answers.
 
 Optional gzip/x-gzip/zstd compression runs after JSON or multipart encoding on official/custom routes only. Both original and transmitted bodies are bounded to 32 MiB, and zstd's window is at most 8 MiB. Preflight reports both sizes and uses the same prepared body as execution. Compression never triggers a retry or fallback.
 

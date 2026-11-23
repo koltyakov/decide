@@ -1,30 +1,20 @@
 package jev
 
 import (
+	"maps"
 	"net/http"
 
 	"github.com/koltyakov/decide/internal/fault"
 )
 
-func validateProvider(request Object, o Options, capabilities Capabilities) error {
+// validateProvider checks state-independent provider rules. hasImages covers
+// assets, attachments, and native parts outside the state.
+func validateProvider(request Object, o Options, capabilities Capabilities, hasImages bool) error {
 	bad := func(message string) error { return fault.New(fault.Usage, o.Provider+": "+message) }
-	hasImages := request["assets"] != nil || len(o.Attachments) > 0
-	if o.Provider == "openrouter" {
-		nativeImages, err := validateOpenRouterImages(request)
-		if err != nil {
-			return err
-		}
-		hasImages = hasImages || nativeImages
-	}
 	for _, value := range request["questions"].(map[string]any) {
 		q := value.(map[string]any)
-		if q["type"] == "box" {
-			if !capabilities.Box {
-				return bad("box is not supported by this provider/model")
-			}
-			if !hasImages {
-				return bad("box requires an image asset")
-			}
+		if q["type"] == "box" && !capabilities.Box {
+			return bad("box is not supported by this provider/model")
 		}
 		if o.Provider == "aimlapi" {
 			if !content(q["instructions"], false) {
@@ -36,11 +26,8 @@ func validateProvider(request Object, o Options, capabilities Capabilities) erro
 		}
 	}
 	if hasImages {
-		if capabilities.Images == "none" {
-			return bad("TypeSafe image assets are not supported by this provider/model")
-		}
-		if !o.Images {
-			return bad("images and box are experimental; pass --experimental-images to opt in")
+		if err := validateImages(o, capabilities, true, false); err != nil {
+			return err
 		}
 	}
 	if o.LongContext && !capabilities.LongContext {
@@ -57,9 +44,29 @@ func validateProvider(request Object, o Options, capabilities Capabilities) erro
 	return nil
 }
 
-func providerRequest(payload Object, o Options) (Object, http.Header, error) {
+// validateImages checks image permissions once the state's images are known.
+func validateImages(o Options, capabilities Capabilities, hasImages, hasBox bool) error {
+	bad := func(message string) error { return fault.New(fault.Usage, o.Provider+": "+message) }
+	if hasBox && !hasImages {
+		return bad("box requires an image asset")
+	}
+	if hasImages {
+		if capabilities.Images == "none" {
+			return bad("TypeSafe image assets are not supported by this provider/model")
+		}
+		if !o.Images {
+			return bad("images and box are experimental; pass --experimental-images to opt in")
+		}
+	}
+	return nil
+}
+
+// providerRequest translates a shallow payload copy. Nested values are shared
+// with the recipe, so translations copy what they change.
+func providerRequest(payload Object, o Options, formats map[string]string) (Object, http.Header, error) {
 	headers := http.Header{}
-	if (o.Provider == "official" || o.Provider == "custom") && payload["assets"] != nil {
+	// TypeSafe requires the images opt-in for assets and for Box questions.
+	if (o.Provider == "official" || o.Provider == "custom") && (payload["assets"] != nil || hasBox(payload)) {
 		headers.Set("TypeSafe-Danger-Zone-Images", "true")
 	}
 	if o.LongContext {
@@ -67,7 +74,8 @@ func providerRequest(payload Object, o Options) (Object, http.Header, error) {
 	}
 	switch o.Provider {
 	case "openrouter":
-		if err := openRouterAssets(payload); err != nil {
+		var err error
+		if payload, err = openRouterAssets(payload, formats); err != nil {
 			return nil, nil, err
 		}
 	case "cloudflare":
@@ -81,10 +89,7 @@ func providerRequest(payload Object, o Options) (Object, http.Header, error) {
 		headers.Set("ai-evaluation-model-specification-version", "4")
 		translated := Object{}
 		for name, value := range payload["questions"].(map[string]any) {
-			q := Object{}
-			for key, field := range value.(map[string]any) {
-				q[key] = field
-			}
+			q := maps.Clone(value.(map[string]any))
 			if q["type"] == "noul" {
 				q["type"] = "boolean"
 			}
@@ -115,4 +120,14 @@ func providerResponse(result Object, provider string) (Object, error) {
 		return inner, nil
 	}
 	return result, nil
+}
+
+func hasBox(payload Object) bool {
+	questions, _ := payload["questions"].(map[string]any)
+	for _, value := range questions {
+		if q, ok := value.(map[string]any); ok && q["type"] == "box" {
+			return true
+		}
+	}
+	return false
 }

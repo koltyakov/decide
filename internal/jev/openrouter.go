@@ -1,40 +1,41 @@
 package jev
 
 import (
-	"bytes"
 	"encoding/base64"
 	"encoding/json"
-	"image"
+	"maps"
 	"strings"
 
 	"github.com/koltyakov/decide/internal/fault"
 )
 
-func openRouterImage(data, format string) (Object, error) {
+var openRouterRules = imageRules{inline: true, minimum: 256, minPixels: 78400}
+
+func openRouterImage(data, format string) error {
 	if len(data) > base64.StdEncoding.EncodedLen(MaxImageBytes) || strings.ContainsAny(data, "\r\n\t ") {
-		return nil, fault.New(fault.Usage, "OpenRouter images require standard padded base64, at most 16 MiB decoded")
+		return fault.New(fault.Usage, "OpenRouter images require standard padded base64, at most 16 MiB decoded")
 	}
 	b, err := base64.StdEncoding.Strict().DecodeString(data)
 	if err != nil {
-		return nil, fault.New(fault.Usage, "invalid OpenRouter image base64")
+		return fault.New(fault.Usage, "invalid OpenRouter image base64")
 	}
-	actual, err := imageFormat(b, 256)
+	info, err := checkImage(b, openRouterRules)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	config, _, _ := image.DecodeConfig(bytes.NewReader(b))
-	if config.Width*config.Height < 78400 {
-		return nil, fault.New(fault.Usage, "OpenRouter Jev images require at least 78,400 pixels in total")
+	if format != info.format {
+		return fault.New(fault.Usage, "OpenRouter image data URL MIME type does not match its bytes")
 	}
-	if format != "" && format != actual {
-		return nil, fault.New(fault.Usage, "OpenRouter image data URL MIME type does not match its bytes")
-	}
-	return Object{"type": "image_url", "image_url": Object{"url": "data:image/" + actual + ";base64," + data}}, nil
+	return nil
 }
 
-// validateOpenRouterImages supports native image parts as well as CLI assets.
+func imagePart(format, data string) Object {
+	return Object{"type": "image_url", "image_url": Object{"url": "data:image/" + format + ";base64," + data}}
+}
+
+// nativeImages validates OpenRouter image parts inside one content value.
 // Remote URLs are never fetched, and parts cannot bypass image opt-in or limits.
-func validateOpenRouterImages(request Object) (bool, error) {
+func nativeImages(value any) (bool, error) {
 	found := false
 	var visit func(any) error
 	visit = func(value any) error {
@@ -53,19 +54,12 @@ func validateOpenRouterImages(request Object) (bool, error) {
 					return fault.New(fault.Usage, "OpenRouter image_url must contain an inline PNG/JPEG data URL")
 				}
 				url, _ := part["url"].(string)
-				format := ""
 				for _, candidate := range []string{"png", "jpeg"} {
-					if strings.HasPrefix(url, "data:image/"+candidate+";base64,") {
-						format = candidate
-						url = strings.TrimPrefix(url, "data:image/"+candidate+";base64,")
-						break
+					if data, ok := strings.CutPrefix(url, "data:image/"+candidate+";base64,"); ok {
+						return openRouterImage(data, candidate)
 					}
 				}
-				if format == "" {
-					return fault.New(fault.Usage, "OpenRouter Jev image_url must be an inline PNG/JPEG data URL; remote URLs are not fetched")
-				}
-				_, err := openRouterImage(url, format)
-				return err
+				return fault.New(fault.Usage, "OpenRouter Jev image_url must be an inline PNG/JPEG data URL; remote URLs are not fetched")
 			}
 			for _, item := range v {
 				if err := visit(item); err != nil {
@@ -75,57 +69,63 @@ func validateOpenRouterImages(request Object) (bool, error) {
 		}
 		return nil
 	}
-	if err := visit(request["state"]); err != nil {
-		return false, err
-	}
-	for _, value := range request["questions"].(map[string]any) {
-		q := value.(map[string]any)
-		if err := visit(q["instructions"]); err != nil {
-			return false, err
-		}
-		switch criteria := q["criteria"].(type) {
+	err := visit(value)
+	return found, err
+}
+
+// questionImages validates native parts in instructions and criterion values.
+// Option names are keys, not media content or image-part attributes.
+func questionImages(questions any) (bool, error) {
+	found := false
+	for _, value := range questionValues(questions) {
+		var items []any
+		switch criteria := value.(type) {
 		case map[string]any:
-			// Option names are keys, not media content or image-part attributes.
 			for _, item := range criteria {
-				if err := visit(item); err != nil {
-					return false, err
-				}
+				items = append(items, item)
 			}
 		case []any:
-			for _, item := range criteria {
-				if err := visit(item); err != nil {
-					return false, err
-				}
+			items = criteria
+		default:
+			items = []any{value}
+		}
+		for _, item := range items {
+			ok, err := nativeImages(item)
+			if err != nil {
+				return false, err
 			}
+			found = found || ok
 		}
 	}
 	return found, nil
 }
 
 // OpenRouter ignores TypeSafe's assets map. Replace references with inline
-// image_url parts at their native positions, including references inside strings.
-func openRouterAssets(request Object) error {
+// image_url parts at their native positions, including whole-token references
+// inside strings. The request and its nested values are never mutated; changed
+// containers are copied, so a shared recipe stays reusable.
+func openRouterAssets(request Object, formats map[string]string) (Object, error) {
 	assets, _ := request["assets"].(map[string]any)
 	if len(assets) == 0 {
-		return nil
+		return request, nil
 	}
 	parts := map[string]Object{}
 	costs := map[string]int{}
+	refs := make([]string, 0, len(assets))
 	for reference, value := range assets {
-		asset := value.(map[string]any)
-		data, _ := asset["data_base64"].(string)
-		part, err := openRouterImage(data, "")
-		if err != nil {
-			return err
-		}
-		encoded, _ := json.Marshal(part)
-		parts[reference] = part
-		costs[reference] = len(encoded) + 8
+		data, _ := value.(map[string]any)["data_base64"].(string)
+		frame, _ := json.Marshal(imagePart(formats[reference], ""))
+		parts[reference] = imagePart(formats[reference], data)
+		// Base64 needs no JSON escaping, so the encoded size is exact.
+		costs[reference] = len(frame) + len(data) + 8
+		refs = append(refs, reference)
 	}
+	matcher := newReferenceMatcher(refs)
+	request = maps.Clone(request)
 	delete(request, "assets")
 	base, err := json.Marshal(request)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	budget := len(base)
 	charge := func(reference string) error {
@@ -135,100 +135,119 @@ func openRouterAssets(request Object) error {
 		}
 		return nil
 	}
-	var replace func(any) (any, error)
-	replace = func(value any) (any, error) {
+	var replace func(any) (any, bool, error)
+	replace = func(value any) (any, bool, error) {
 		switch v := value.(type) {
 		case string:
 			if part, ok := parts[v]; ok {
-				if err := charge(v); err != nil {
-					return nil, err
-				}
-				return part, nil
+				return part, true, charge(v)
 			}
-			remaining := v
 			var result []any
-			for {
-				index, best := -1, ""
-				for reference := range parts {
-					position := strings.Index(remaining, reference)
-					if position >= 0 && (index < 0 || position < index || (position == index && len(reference) > len(best))) {
-						index, best = position, reference
-					}
+			last := 0
+			for at, ref := matcher.next(v, 0); at >= 0; at, ref = matcher.next(v, last) {
+				if err := charge(ref); err != nil {
+					return nil, false, err
 				}
-				if index < 0 {
-					break
+				if at > last {
+					result = append(result, v[last:at])
 				}
-				if err := charge(best); err != nil {
-					return nil, err
-				}
-				if index > 0 {
-					result = append(result, remaining[:index])
-				}
-				result = append(result, parts[best])
-				remaining = remaining[index+len(best):]
+				result = append(result, parts[ref])
+				last = at + len(ref)
 			}
-			if len(result) == 0 {
-				return v, nil
+			if result == nil {
+				return v, false, nil
 			}
-			if remaining != "" {
-				result = append(result, remaining)
+			if last < len(v) {
+				result = append(result, v[last:])
 			}
-			return result, nil
+			return result, true, nil
 		case []any:
+			var out []any
 			for i, item := range v {
-				next, err := replace(item)
+				next, changed, err := replace(item)
 				if err != nil {
-					return nil, err
+					return nil, false, err
 				}
-				v[i] = next
+				if changed && out == nil {
+					out = append([]any(nil), v...)
+				}
+				if out != nil {
+					out[i] = next
+				}
 			}
+			if out == nil {
+				return v, false, nil
+			}
+			return out, true, nil
 		case map[string]any:
 			// Native image parts were already validated; never rewrite base64 URLs.
 			if v["type"] == "image_url" {
-				return v, nil
+				return v, false, nil
 			}
-			for key, item := range v {
-				next, err := replace(item)
-				if err != nil {
-					return nil, err
-				}
-				v[key] = next
-			}
+			return replaceMembers(v, replace)
 		}
-		return value, nil
+		return value, false, nil
 	}
-	state, err := replace(request["state"])
-	if err != nil {
-		return err
+	if state, changed, err := replace(request["state"]); err != nil {
+		return nil, err
+	} else if changed {
+		request["state"] = state
 	}
-	request["state"] = state
-	for _, value := range request["questions"].(map[string]any) {
+	questions := map[string]any{}
+	for name, value := range request["questions"].(map[string]any) {
 		q := value.(map[string]any)
-		if item, ok := q["instructions"]; ok {
-			next, err := replace(item)
-			if err != nil {
-				return err
+		updated, cloned := q, false
+		set := func(key string, next any) {
+			if !cloned {
+				updated, cloned = maps.Clone(q), true
 			}
-			q["instructions"] = next
+			updated[key] = next
 		}
-		switch criteria := q["criteria"].(type) {
+		if item, ok := q["instructions"]; ok {
+			next, changed, err := replace(item)
+			if err != nil {
+				return nil, err
+			}
+			if changed {
+				set("instructions", next)
+			}
+		}
+		var criteria any
+		changed := false
+		switch c := q["criteria"].(type) {
 		case map[string]any:
-			for key, item := range criteria {
-				next, err := replace(item)
-				if err != nil {
-					return err
-				}
-				criteria[key] = next
-			}
+			criteria, changed, err = replaceMembers(c, replace)
 		case []any:
-			for i, item := range criteria {
-				next, err := replace(item)
-				if err != nil {
-					return err
-				}
-				criteria[i] = next
+			criteria, changed, err = replace(c)
+		}
+		if err != nil {
+			return nil, err
+		}
+		if changed {
+			set("criteria", criteria)
+		}
+		questions[name] = updated
+	}
+	request["questions"] = questions
+	return request, nil
+}
+
+func replaceMembers(v map[string]any, replace func(any) (any, bool, error)) (any, bool, error) {
+	var out map[string]any
+	for key, item := range v {
+		next, changed, err := replace(item)
+		if err != nil {
+			return nil, false, err
+		}
+		if changed {
+			if out == nil {
+				out = maps.Clone(v)
 			}
+			out[key] = next
 		}
 	}
-	return nil
+	if out == nil {
+		return v, false, nil
+	}
+	return out, true, nil
 }

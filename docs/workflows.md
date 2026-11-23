@@ -11,7 +11,7 @@ decide systemone examples/triage.json --dry-run
 decide batch examples/triage.json --states examples/states.jsonl --dry-run
 ```
 
-Preview fields include `provider`, `endpoint`, `model`, `request`, `headers`, `bodyBytes`, `uncompressedBodyBytes`, `compression`, `uploads`, and `policy`. `bodyBytes` is the transmitted size after optional compression; `uncompressedBodyBytes` includes the encoded JSON or multipart framing before compression. The request remains a readable JSON object, not compressed bytes. Headers omit authorization. Upload metadata contains reference, format, and bytes, not file contents. Inline base64 assets remain in the preview's request. Supplied state and instructions are printed, so don't send previews to public logs.
+Preview fields include `provider`, `endpoint`, `model`, `request`, `headers`, `bodyBytes`, `uncompressedBodyBytes`, `compression`, `uploads`, and `policy`. `bodyBytes` is the transmitted size after optional compression; `uncompressedBodyBytes` includes the encoded JSON or multipart framing before compression. The request remains a readable JSON object, not compressed bytes. Headers omit authorization. Upload metadata contains reference, format, and bytes, not file contents. Inline base64 assets remain in the CLI preview's request by default. `--preview-images summary` replaces inline image bytes, including OpenRouter data URLs, with `[omitted: N image bytes]` while keeping every other member and the encoded sizes. MCP `dryRun` always uses the summary, because the caller already holds the bytes. Supplied state and instructions are printed, so don't send previews to public logs.
 
 Official/custom calls accept `--compression gzip`, `--compression x-gzip`, or `--compression zstd`; the default is `none`. Preflight and execution use the same compressed body. Both sizes must fit 32 MiB. Compression cannot bypass native limits and never enables an automatic fallback or retry. Batches reuse the invocation's compression setting independently for each record.
 
@@ -24,15 +24,25 @@ Policies are optional. No default threshold is applied. A policy selects one que
 | CLI flag | MCP policy field | Applies to |
 | --- | --- | --- |
 | `--answer NAME` | `answer` | Explicit question selection; required with multiple questions |
-| `--at-least N` | `atLeast` | Noul probability or Score level |
-| `--is KEY` | `is` | A declared Choice option |
+| `--at-least N` | `atLeast` | Minimum Noul probability or Score level |
+| `--at-most N` | `atMost` | Maximum Noul probability or Score level |
+| `--is KEY`, repeatable | `is`, a string or array | A declared Choice option; with several keys, any one of them |
 | `--min-confidence N` | `minConfidence` | Choice, Score, or Box confidence |
+
+`atLeast` and `atMost` together form a closed range and `atLeast` must not exceed `atMost`. Use `atMost` for a low-risk gate instead of inverting the question.
+
+To gate several answers, pass a policy array. The CLI takes it as literal JSON in `--policy`; MCP takes it as `policy`. Every rule of every policy must pass. Each policy in an array needs at least one rule, and there are at most 64 policies. `--policy` replaces `--at-least`, `--at-most`, `--is`, and `--min-confidence`. With `--policy`, `--answer` only selects `--output value`. Policy members are matched exactly, so a misspelled rule such as `atleast` is an input error, never a silently disabled gate:
+
+```sh
+decide systemone examples/triage.json \
+  --policy '[{"answer":"urgent","atMost":0.2},{"answer":"team","is":["billing","technical"]}]'
+```
 
 Confidence is not probability. Noul has no confidence gate; use its probability. A confidence gate fails when the value is missing, null, non-numeric, non-finite, or outside 0 to 1. This remains true for `minConfidence: 0`.
 
 Thresholds must fit the question's range. A score with three levels supports 0 to 2; a Noul supports 0 to 1. An unknown Choice key, a missing question selection, or a policy for the wrong primitive fails before an API call.
 
-The native response is unchanged except for explicit client metadata when a gate is requested:
+The native response is unchanged except for explicit client metadata when a gate is requested. One policy adds `_decide.policy` and `_decide.gate`:
 
 ```json
 {
@@ -49,7 +59,7 @@ The native response is unchanged except for explicit client metadata when a gate
 }
 ```
 
-CLI exit status is 5 for this valid rejection. There is no extra error on stderr. MCP returns this as a successful tool result, not a tool error. Invalid requests and provider failures still use their normal error channels.
+A policy array adds `_decide.policies`, `_decide.gates` in the same order, and `_decide.passed`. CLI exit status is 5 for any valid rejection. There is no extra error on stderr. MCP returns this as a successful tool result, not a tool error. Invalid requests and provider failures still use their normal error channels.
 
 `--output value` extracts the primitive value and retains gate exit behavior. With multiple questions, specify `--answer`. `--output raw` bypasses client metadata and cannot be combined with acceptance rules. JSON output preserves native answer keys; it does not replace them with a universal value field.
 
@@ -79,13 +89,17 @@ Each output line corresponds to one non-empty input line in the same order:
 
 ```jsonl
 {"index":0,"ok":true,"response":{"answers":{"urgent":{"noul":0.8}}}}
-{"index":1,"ok":false,"error":"API HTTP 429; not retried","code":4}
+{"index":1,"ok":false,"error":"API HTTP 429 (rate limited); not retried; retry-after 5s","code":4}
 ```
 
 The command processes independent records after per-record errors. It reports all results, then exits 6 if any records failed, otherwise 5 if any gates were rejected, otherwise 0. A rejected record has `ok: true`, a valid response, and `code: 5`. No error is silently converted into a decision.
 
-The default `--jobs 1` makes request spending serial and explicit. Values up to 16 use fixed-size concurrent windows. Every window drains before the next starts, so a slow early request cannot build an unbounded reorder queue. This trades some throughput under uneven latency for bounded memory and predictable ordering. Each line is limited to 32 MiB; memory grows with window size and request bodies, not the entire input stream. Output is compact JSONL; `--pretty` and non-JSON output are rejected.
+The default `--jobs 1` makes request spending serial and explicit. Values up to 16 use a sliding window: at most `--jobs` requests are in flight, and at most twice that many records are held for in-order output. When a record finishes, the next one starts even if an earlier record is still running. A slow record delays only its own output until the reorder buffer fills, so memory stays bounded. Each line is limited to 32 MiB; memory grows with the window and request bodies, not the entire input stream. Output is compact JSONL; `--pretty` and non-JSON output are rejected.
 
-Cancellation stops later windows and reaches in-flight HTTP requests. Completed calls can still be billed; no interrupted request is automatically retried. An unreadable or oversized input line stops scanning with an input error, after any already processed rows.
+The recipe is validated once, before any state is read: its questions, provider rules, image opt-in, and inline assets, with each inline image decoded once. A recipe error is a usage error (exit 2), not one failure per record. Each record then validates only its state and the asset references the recipe's questions don't already contain. A stored key is read once per batch. If it is missing, every record still reports the authentication failure.
+
+Records keep their original zero-based `index` when resuming. `--from-index N` skips earlier non-empty records. `--only-failed FILE` reads a prior batch output file and reruns only records with `ok: false`. Rejected gates are valid results and are not rerun. Both flags are explicit choices; Decide never reruns records on its own. Billing for interrupted or failed requests depends on the provider.
+
+Cancellation stops starting records and reaches in-flight HTTP requests. Completed calls can still be billed; no interrupted request is automatically retried. An unreadable or oversized input line stops scanning with an input error, after any already processed rows.
 
 Batch supports native inline assets in the recipe and state references in each row. It does not accept file-attachment flags or read per-row image paths. Use a normal multipart `systemone` call for local image files, or construct native inline asset recipes for batch use.

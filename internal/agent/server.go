@@ -11,7 +11,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-const Instructions = "Decide provides access to Jev, TypeSafe AI's typed decision model. Use capabilities first to inspect the configured provider/model and process permissions offline. models explicitly queries its catalog, not inference. Decision calls send authorized state to the provider and may be billed; never retry uncertain calls automatically. Model answers never authorize downstream actions. Use noul for yes/no probability, choice for classification, score for a rubric, box for image localization, and systemone for independent named questions. Keep native state, instructions, criteria, questions, and assets. Results preserve answers, probabilities, confidence, legend, model, and usage. Optional policy adds client-owned _decide.gate metadata; rejected gates are valid results, not tool errors. dryRun validates and previews supplied private content without an API call or a key. Images and box require process-level experimental opt-in and a supporting provider/model. Inline PNG/JPEG assets never read local paths or fetch URLs. Box has no not-found result; pair it with a presence noul. Provider, endpoint, compression, and experimental permissions are configured outside tool arguments. The embedded CLI usage skill is available as the resource decide://skills/decide; it is separate from these MCP tool schemas."
+const Instructions = "Decide provides access to Jev, TypeSafe AI's typed decision model. Use capabilities first to inspect the configured provider/model and process permissions offline. models explicitly queries its catalog, not inference. Decision calls send authorized state to the provider and may be billed; never retry uncertain calls automatically. Model answers never authorize downstream actions. Use noul for yes/no probability, choice for classification, score for a rubric, box for image localization, and systemone for independent named questions. Keep native state, instructions, criteria, questions, and assets. Results preserve answers, probabilities, confidence, legend, model, and usage. Optional policy adds client-owned _decide.gate metadata, or _decide.gates for a policy array; rejected gates are valid results, not tool errors. dryRun validates and previews supplied private content without an API call or a key, omitting inline image bytes. Images and box require process-level experimental opt-in and a supporting provider/model. Inline PNG/JPEG assets never read local paths or fetch URLs. Box has no not-found result; pair it with a presence noul. Provider, endpoint, compression, and experimental permissions are configured outside tool arguments. The embedded CLI usage skill is available as the resource decide://skills/decide; it is separate from these MCP tool schemas."
 
 func Server(client jev.Client, defaults jev.Options, version string) *mcp.Server {
 	s := mcp.NewServer(&mcp.Implementation{Name: "decide", Version: version}, &mcp.ServerOptions{Instructions: Instructions})
@@ -53,13 +53,20 @@ func Server(client jev.Client, defaults jev.Options, version string) *mcp.Server
 		questionTypes = append(questionTypes, q)
 	}
 	question := jev.Object{"oneOf": questionTypes}
-	policy := jev.Object{"type": "object", "additionalProperties": false, "description": "Optional local acceptance rules. No implicit thresholds; all rules must pass. Missing confidence fails closed.", "properties": jev.Object{
+	rules := jev.Object{"type": "object", "additionalProperties": false, "properties": jev.Object{
 		"answer":  text("Named question to gate. Required when there are multiple questions."),
 		"atLeast": jev.Object{"type": "number", "minimum": 0, "description": "Minimum noul probability or score"},
-		"is":      text("Required declared choice key"), "minConfidence": jev.Object{"type": "number", "minimum": 0, "maximum": 1, "description": "Minimum confidence for choice, score, or box. Noul uses atLeast instead."},
+		"atMost":  jev.Object{"type": "number", "minimum": 0, "description": "Maximum noul probability or score"},
+		"is": jev.Object{"description": "Declared choice key, or several keys of which the answer must be one", "anyOf": []any{
+			jev.Object{"type": "string"}, jev.Object{"type": "array", "minItems": 1, "items": jev.Object{"type": "string"}},
+		}},
+		"minConfidence": jev.Object{"type": "number", "minimum": 0, "maximum": 1, "description": "Minimum confidence for choice, score, or box. Noul uses atLeast or atMost instead."},
+	}}
+	policy := jev.Object{"description": "Optional local acceptance rules: one policy object, or an array of policies for several answers. No implicit thresholds; every rule of every policy must pass. Missing confidence fails closed.", "anyOf": []any{
+		rules, jev.Object{"type": "array", "minItems": 1, "maxItems": decision.MaxPolicies, "items": rules},
 	}}
 	for _, kind := range []string{"noul", "choice", "score", "box", "systemone"} {
-		properties := jev.Object{"model": modelSchema(), "policy": policy, "dryRun": jev.Object{"type": "boolean", "description": "Validate and preview private supplied content without credentials or a network request"}}
+		properties := jev.Object{"model": modelSchema(), "policy": policy, "dryRun": jev.Object{"type": "boolean", "description": "Validate and preview private supplied content without credentials or a network request. Inline image bytes are replaced by their size."}}
 		required := []string{"state"}
 		if kind == "systemone" {
 			properties["request"] = jev.Object{"type": "object", "required": []string{"state", "questions"}, "properties": jev.Object{
@@ -93,10 +100,11 @@ func Server(client jev.Client, defaults jev.Options, version string) *mcp.Server
 			if value, ok := args["model"].(string); ok {
 				o.Model = value
 			}
-			var p decision.Policy
+			var policies decision.Policies
 			if value, ok := args["policy"]; ok {
 				b, _ := json.Marshal(value)
-				if err := jev.Decode(b, &p); err != nil {
+				var err error
+				if policies, err = decision.ParsePolicies(b); err != nil {
 					return toolError(err), nil
 				}
 			}
@@ -115,8 +123,12 @@ func Server(client jev.Client, defaults jev.Options, version string) *mcp.Server
 					request["assets"] = value
 				}
 			}
-			dryRun, _ := args["dryRun"].(bool)
-			result, err := decision.Evaluate(ctx, client, request, o, p, dryRun)
+			// The caller supplied any image bytes, so previews omit them.
+			mode := decision.Execute
+			if dryRun, _ := args["dryRun"].(bool); dryRun {
+				mode = decision.PreviewSummary
+			}
+			result, err := decision.Evaluate(ctx, client, request, o, policies, mode)
 			if err != nil {
 				return toolError(err), nil
 			}

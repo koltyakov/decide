@@ -1,11 +1,12 @@
 package jev
 
 import (
+	"maps"
 	"net"
 	"net/url"
 	"os"
 	"regexp"
-	"sort"
+	"slices"
 	"strings"
 
 	"github.com/koltyakov/decide/internal/fault"
@@ -26,32 +27,45 @@ type Capabilities struct {
 	Compression []string `json:"compression"`
 }
 
-func Providers() map[string]Provider {
-	return map[string]Provider{
-		"official":     {Endpoint: "https://api.typesafe.ai/v1/systemone", KeyEnv: "TYPESAFE_API_KEY", Model: "jev-latest", Family: "jev", Capabilities: Capabilities{Images: "multipart", Box: true, LongContext: true, Models: true, Compression: []string{"gzip", "x-gzip", "zstd"}}},
-		"vercel":       {Endpoint: "https://ai-gateway.vercel.sh/v4/ai/evaluation-model", KeyEnv: "AI_GATEWAY_API_KEY", Model: "typesafe-ai/jev-1.14.0", Family: "jev", Capabilities: Capabilities{Images: "none"}},
-		"openrouter":   {Endpoint: "https://openrouter.ai/api/alpha/decisions", KeyEnv: "OPENROUTER_API_KEY", Model: "~typesafe/jev-latest", Family: "jev", Capabilities: Capabilities{Images: "parts", Box: true, Models: true}},
-		"digitalocean": {Endpoint: "https://inference.do-ai.run/v1/systemone", KeyEnv: "DIGITALOCEAN_MODEL_ACCESS_KEY", Model: "typesafe-jev-1.13.0", Family: "jev", Capabilities: Capabilities{Images: "none", Models: true}},
-		"aimlapi":      {Endpoint: "https://api.aimlapi.com/v1/decisions", KeyEnv: "AIMLAPI_KEY", Model: "typesafe/jev", Family: "jev", Capabilities: Capabilities{Images: "base64", Box: true}},
-		"custom":       {KeyEnv: "DECIDE_API_KEY", Model: "jev-latest", Family: "custom", Capabilities: Capabilities{Images: "multipart", Box: true, LongContext: true, Models: true, Compression: []string{"gzip", "x-gzip", "zstd"}}},
-		"cloudflare":   {KeyEnv: "CLOUDFLARE_API_TOKEN", Model: "typesafe/jev", Family: "jev", Capabilities: Capabilities{Images: "none"}},
-		"clef":         {KeyEnv: "CLOUDFLARE_API_TOKEN", Model: "clef-flash", Family: "clef", Capabilities: Capabilities{Images: "none"}},
-	}
+var providers = map[string]Provider{
+	"official":     {Endpoint: "https://api.typesafe.ai/v1/systemone", KeyEnv: "TYPESAFE_API_KEY", Model: "jev-latest", Family: "jev", Capabilities: Capabilities{Images: "multipart", Box: true, LongContext: true, Models: true, Compression: []string{"gzip", "x-gzip", "zstd"}}},
+	"vercel":       {Endpoint: "https://ai-gateway.vercel.sh/v4/ai/evaluation-model", KeyEnv: "AI_GATEWAY_API_KEY", Model: "typesafe-ai/jev-1.14.0", Family: "jev", Capabilities: Capabilities{Images: "none"}},
+	"openrouter":   {Endpoint: "https://openrouter.ai/api/alpha/decisions", KeyEnv: "OPENROUTER_API_KEY", Model: "~typesafe/jev-latest", Family: "jev", Capabilities: Capabilities{Images: "parts", Box: true, Models: true}},
+	"digitalocean": {Endpoint: "https://inference.do-ai.run/v1/systemone", KeyEnv: "DIGITALOCEAN_MODEL_ACCESS_KEY", Model: "typesafe-jev-1.13.0", Family: "jev", Capabilities: Capabilities{Images: "none", Models: true}},
+	"aimlapi":      {Endpoint: "https://api.aimlapi.com/v1/decisions", KeyEnv: "AIMLAPI_KEY", Model: "typesafe/jev", Family: "jev", Capabilities: Capabilities{Images: "base64", Box: true}},
+	"custom":       {KeyEnv: "DECIDE_API_KEY", Model: "jev-latest", Family: "custom", Capabilities: Capabilities{Images: "multipart", Box: true, LongContext: true, Models: true, Compression: []string{"gzip", "x-gzip", "zstd"}}},
+	"cloudflare":   {KeyEnv: "CLOUDFLARE_API_TOKEN", Model: "typesafe/jev", Family: "jev", Capabilities: Capabilities{Images: "none"}},
+	"clef":         {KeyEnv: "CLOUDFLARE_API_TOKEN", Model: "clef-flash", Family: "clef", Capabilities: Capabilities{Images: "none"}},
 }
 
-func ProviderNames() []string {
-	names := make([]string, 0, len(Providers()))
-	for name := range Providers() {
-		names = append(names, name)
+var (
+	providerNames     = slices.Sorted(maps.Keys(providers))
+	cloudflareAccount = regexp.MustCompile(`^[a-fA-F0-9]{32}$`)
+)
+
+// Providers returns a copy of the built-in provider table.
+func Providers() map[string]Provider { return maps.Clone(providers) }
+
+func ProviderNames() []string { return slices.Clone(providerNames) }
+
+// envProvider and envEndpoint are the environment layer of the documented
+// flag > environment > saved > built-in precedence, shared by both resolvers.
+func envProvider() string { return os.Getenv("DECIDE_PROVIDER") }
+
+func envEndpoint(provider string) string {
+	switch provider {
+	case "custom":
+		return os.Getenv("DECIDE_ENDPOINT")
+	case "official":
+		return os.Getenv("TYPESAFE_API_URL")
 	}
-	sort.Strings(names)
-	return names
+	return ""
 }
 
 func Lookup(name string) (Provider, error) {
-	p, ok := Providers()[name]
+	p, ok := providers[name]
 	if !ok {
-		return p, fault.New(fault.Usage, "provider must be one of: "+strings.Join(ProviderNames(), ", "))
+		return p, fault.New(fault.Usage, "provider must be one of: "+strings.Join(providerNames, ", "))
 	}
 	return p, nil
 }
@@ -69,7 +83,7 @@ type Options struct {
 
 func (o Options) resolve(request Object) (Options, string, error) {
 	if o.Provider == "" {
-		o.Provider = os.Getenv("DECIDE_PROVIDER")
+		o.Provider = envProvider()
 	}
 	if o.Provider == "" {
 		o.Provider = "official"
@@ -104,17 +118,14 @@ func (o Options) resolve(request Object) (Options, string, error) {
 		return o, "", fault.New(fault.Usage, "clef supports only clef and clef-flash; for Jev use --provider cloudflare")
 	}
 	if o.Endpoint == "" {
-		o.Endpoint = p.Endpoint
+		o.Endpoint = envEndpoint(o.Provider)
+		if o.Endpoint == "" {
+			o.Endpoint = p.Endpoint
+		}
 		switch o.Provider {
-		case "custom":
-			o.Endpoint = os.Getenv("DECIDE_ENDPOINT")
-		case "official":
-			if value := os.Getenv("TYPESAFE_API_URL"); value != "" {
-				o.Endpoint = value
-			}
 		case "cloudflare", "clef":
 			account := os.Getenv("CLOUDFLARE_ACCOUNT_ID")
-			if !regexp.MustCompile(`^[a-fA-F0-9]{32}$`).MatchString(account) {
+			if !cloudflareAccount.MatchString(account) {
 				return o, "", fault.New(fault.Usage, o.Provider+" requires CLOUDFLARE_ACCOUNT_ID with 32 hexadecimal characters")
 			}
 			o.Endpoint = "https://api.cloudflare.com/client/v4/accounts/" + account + "/ai/run"

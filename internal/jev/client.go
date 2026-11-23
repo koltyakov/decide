@@ -3,12 +3,15 @@ package jev
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"math"
 	"net/http"
-	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,7 +24,8 @@ type Client struct {
 	HTTP        *http.Client
 	Timeout     time.Duration
 	Version     string
-	// Key is an ephemeral connection-test credential, never a CLI argument.
+	// Key is an in-memory credential for connection tests and preloaded
+	// batches, never a CLI argument.
 	Key string
 }
 
@@ -45,8 +49,69 @@ func (p *Prepared) Preview() Object {
 		"request": p.payload, "headers": p.headers, "bodyBytes": len(p.body), "uncompressedBodyBytes": p.uncompressedBytes, "compression": p.options.Compression, "uploads": images}
 }
 
-// Prepare validates and encodes a request without loading credentials or accessing the network.
-func Prepare(request Object, options Options) (*Prepared, error) {
+// Summary is Preview with inline image bytes replaced by their decoded size.
+// Sizes and every other request member are unchanged.
+func (p *Prepared) Summary() Object {
+	preview := p.Preview()
+	preview["request"] = omitImageData(p.payload)
+	return preview
+}
+
+// Recipe is a validated request whose state is supplied per call. Questions,
+// assets, and provider checks are validated and images decoded once. A Recipe
+// is immutable, so concurrent Prepare calls may share it.
+type Recipe struct {
+	base         Object
+	options      Options
+	keyEnv       string
+	capabilities Capabilities
+	formats      map[string]string
+	pending      []string // asset references not found in questions
+	images, box  bool
+}
+
+// NewRecipe validates and binds everything except state, without credentials or network access.
+func NewRecipe(request Object, options Options) (*Recipe, error) {
+	payload, err := copyRequest(request)
+	if err != nil {
+		return nil, err
+	}
+	return newRecipe(payload, options)
+}
+
+// Questions returns the recipe's validated questions; callers must not modify them.
+func (r *Recipe) Questions() Object { return r.base["questions"].(map[string]any) }
+
+// Prepare copies state and encodes one request from the recipe.
+func (r *Recipe) Prepare(state any) (*Prepared, error) {
+	b, err := json.Marshal(state)
+	if err != nil || len(b) > MaxBytes {
+		return nil, fault.New(fault.Usage, "state is not JSON or exceeds 32 MiB")
+	}
+	var owned any
+	if err = Decode(b, &owned); err != nil {
+		return nil, err
+	}
+	if err = validateState(owned); err != nil {
+		return nil, err
+	}
+	return r.prepare(owned)
+}
+
+// PrepareJSON decodes one JSON state, which the recipe then owns, and encodes
+// a request. It avoids a second copy of states read from JSONL.
+func (r *Recipe) PrepareJSON(state []byte) (*Prepared, error) {
+	var owned any
+	if err := Decode(state, &owned); err != nil {
+		return nil, err
+	}
+	if err := validateState(owned); err != nil {
+		return nil, err
+	}
+	return r.prepare(owned)
+}
+
+func copyRequest(request Object) (Object, error) {
 	// Copy before applying defaults or translating provider-specific fields.
 	b, err := json.Marshal(request)
 	if err != nil || len(b) > MaxBytes {
@@ -56,7 +121,32 @@ func Prepare(request Object, options Options) (*Prepared, error) {
 	if err = Decode(b, &payload); err != nil {
 		return nil, err
 	}
-	if err = Validate(payload); err != nil {
+	return payload, nil
+}
+
+// Prepare validates and encodes a request without loading credentials or accessing the network.
+func Prepare(request Object, options Options) (*Prepared, error) {
+	payload, err := copyRequest(request)
+	if err != nil {
+		return nil, err
+	}
+	state := payload["state"]
+	if err = validateState(state); err != nil {
+		return nil, err
+	}
+	r, err := newRecipe(payload, options)
+	if err != nil {
+		return nil, err
+	}
+	return r.prepare(state)
+}
+
+// newRecipe takes ownership of payload.
+func newRecipe(payload Object, options Options) (*Recipe, error) {
+	if payload == nil {
+		return nil, fault.New(fault.Usage, "request must be a JSON object with named questions")
+	}
+	if err := validateRecipe(payload); err != nil {
 		return nil, err
 	}
 	o, keyEnv, err := options.resolve(payload)
@@ -66,28 +156,71 @@ func Prepare(request Object, options Options) (*Prepared, error) {
 	payload["model"] = o.Model
 	provider, _ := Lookup(o.Provider)
 	capabilities := provider.CapabilitiesFor(o.Model)
-	if err = validateProvider(payload, o, capabilities); err != nil {
-		return nil, err
-	}
-	minimum := 280
-	if o.Provider == "aimlapi" || o.Provider == "openrouter" {
-		minimum = 256
-	}
-	if err = prepareAssets(payload, o.Attachments, capabilities.Images == "base64" || capabilities.Images == "parts", minimum); err != nil {
-		return nil, err
-	}
 	questions := payload["questions"].(map[string]any)
-	payload, headers, err := providerRequest(payload, o)
+	images := payload["assets"] != nil || len(o.Attachments) > 0
+	if o.Provider == "openrouter" {
+		native, err := questionImages(questions)
+		if err != nil {
+			return nil, err
+		}
+		images = images || native
+	}
+	if err = validateProvider(payload, o, capabilities, images); err != nil {
+		return nil, err
+	}
+	rules := imageRules{inline: capabilities.Images == "base64" || capabilities.Images == "parts", minimum: 280}
+	if o.Provider == "aimlapi" {
+		rules.minimum = 256
+	}
+	if o.Provider == "openrouter" {
+		rules = openRouterRules
+	}
+	formats, err := bindAssets(payload, o.Attachments, rules)
 	if err != nil {
 		return nil, err
 	}
-	b, err = json.Marshal(payload)
+	refs := make([]string, 0, len(formats))
+	for ref := range formats {
+		refs = append(refs, ref)
+	}
+	box := false
+	for _, value := range questions {
+		box = box || value.(map[string]any)["type"] == "box"
+	}
+	delete(payload, "state")
+	return &Recipe{base: payload, options: o, keyEnv: keyEnv, capabilities: capabilities, formats: formats,
+		pending: unreferenced(refs, questionValues(questions)...), images: images, box: box}, nil
+}
+
+// prepare encodes state, which the caller has copied and validated.
+func (r *Recipe) prepare(state any) (*Prepared, error) {
+	images := r.images
+	if r.options.Provider == "openrouter" {
+		native, err := nativeImages(state)
+		if err != nil {
+			return nil, err
+		}
+		images = images || native
+	}
+	if err := validateImages(r.options, r.capabilities, images, r.box); err != nil {
+		return nil, err
+	}
+	if len(unreferenced(r.pending, state)) > 0 {
+		return nil, errUnreferencedAsset
+	}
+	payload := maps.Clone(r.base)
+	payload["state"] = state
+	payload, headers, err := providerRequest(payload, r.options, r.formats)
+	if err != nil {
+		return nil, err
+	}
+	b, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err
 	}
 	contentType := "application/json"
-	if len(o.Attachments) > 0 && capabilities.Images == "multipart" {
-		b, contentType, err = multipartBody(b, o.Attachments)
+	if len(r.options.Attachments) > 0 && r.capabilities.Images == "multipart" {
+		b, contentType, err = multipartBody(b, r.options.Attachments)
 		if err != nil {
 			return nil, err
 		}
@@ -97,14 +230,14 @@ func Prepare(request Object, options Options) (*Prepared, error) {
 	}
 	headers.Set("Content-Type", contentType)
 	uncompressedBytes := len(b)
-	b, err = compressBody(b, o.Compression)
+	b, err = compressBody(b, r.options.Compression)
 	if err != nil {
 		return nil, err
 	}
-	if o.Compression != "none" {
-		headers.Set("Content-Encoding", o.Compression)
+	if r.options.Compression != "none" {
+		headers.Set("Content-Encoding", r.options.Compression)
 	}
-	return &Prepared{Questions: questions, payload: payload, options: o, keyEnv: keyEnv, headers: headers, body: b, uncompressedBytes: uncompressedBytes}, nil
+	return &Prepared{Questions: r.Questions(), payload: payload, options: r.options, keyEnv: r.keyEnv, headers: headers, body: b, uncompressedBytes: uncompressedBytes}, nil
 }
 
 func (c Client) Evaluate(ctx context.Context, request Object, options Options) (Object, error) {
@@ -213,6 +346,16 @@ func (c Client) Models(ctx context.Context, options Options) (Object, error) {
 	return result, nil
 }
 
+// Preload resolves the recipe's credential once, so a batch doesn't reread the
+// store for every record. A lookup failure leaves the client unchanged and is
+// reported by each Execute call as before.
+func (c Client) Preload(r *Recipe) Client {
+	if key, err := c.key(r.options.Provider, r.keyEnv); err == nil {
+		c.Key = key
+	}
+	return c
+}
+
 func (c Client) key(provider, env string) (string, error) {
 	if c.Key != "" {
 		return c.Key, nil
@@ -229,7 +372,7 @@ func (c Client) Resolve(options Options) (Options, error) {
 		return options, err
 	}
 	if options.Provider == "" {
-		options.Provider = os.Getenv("DECIDE_PROVIDER")
+		options.Provider = envProvider()
 	}
 	if options.Provider == "" {
 		options.Provider = saved.Default
@@ -242,12 +385,7 @@ func (c Client) Resolve(options Options) (Options, error) {
 	}
 	connection := saved.Providers[options.Provider]
 	if options.Endpoint == "" {
-		switch options.Provider {
-		case "custom":
-			options.Endpoint = os.Getenv("DECIDE_ENDPOINT")
-		case "official":
-			options.Endpoint = os.Getenv("TYPESAFE_API_URL")
-		}
+		options.Endpoint = envEndpoint(options.Provider)
 		if options.Endpoint == "" {
 			options.Endpoint = connection.Endpoint
 		}
@@ -296,6 +434,10 @@ func (c Client) send(ctx context.Context, method, endpoint string, headers http.
 	}
 	defer func() { _ = res.Body.Close() }()
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		// Read a bounded prefix so the connection can be reused. Error bodies can
+		// echo credentials or private input, so only a fixed, documented error
+		// code is ever matched; body text is never reported.
+		prefix, _ := io.ReadAll(io.LimitReader(res.Body, 64<<10))
 		code := fault.Failure
 		if res.StatusCode == 401 || res.StatusCode == 403 {
 			code = fault.Auth
@@ -303,7 +445,7 @@ func (c Client) send(ctx context.Context, method, endpoint string, headers http.
 			code = fault.Remote
 		}
 		// Error bodies can echo credentials or private input. Do not print them.
-		return nil, fault.New(code, fmt.Sprintf("API HTTP %d; not retried", res.StatusCode))
+		return nil, fault.New(code, fmt.Sprintf("API HTTP %d%s; not retried", res.StatusCode, statusHint(res.StatusCode, prefix))+responseDetails(res.Header))
 	}
 	data, err := io.ReadAll(io.LimitReader(res.Body, MaxBytes+1))
 	if err != nil || len(data) > MaxBytes {
@@ -357,4 +499,108 @@ func validateAnswer(answer, spec Object) error {
 		return fault.New(fault.Failure, "API returned an invalid "+kind+" answer")
 	}
 	return nil
+}
+
+// statusHint names documented TypeSafe failure meanings without echoing the body.
+func statusHint(status int, body []byte) string {
+	switch status {
+	case http.StatusBadRequest:
+		if bytes.Contains(body, []byte("max_tokens_exceeded")) {
+			return " (max_tokens_exceeded: request exceeds the model's context length)"
+		}
+		return " (request rejected by API validation)"
+	case http.StatusRequestEntityTooLarge:
+		return " (request body exceeds the API limit)"
+	case http.StatusUnsupportedMediaType:
+		return " (unsupported or layered Content-Encoding)"
+	case http.StatusUnprocessableEntity:
+		return " (request failed API schema validation)"
+	case http.StatusTooManyRequests:
+		return " (rate limited)"
+	case 529:
+		return " (API overloaded)"
+	}
+	return ""
+}
+
+var requestID = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,128}$`)
+
+// responseDetails reports validated scheduling and support headers. They are
+// never bodies, and values outside strict formats are dropped.
+func responseDetails(h http.Header) string {
+	var details []string
+	if value := strings.TrimSpace(h.Get("Retry-After")); value != "" {
+		if seconds, err := strconv.Atoi(value); err == nil && seconds >= 0 && seconds <= 7*24*3600 {
+			details = append(details, "retry-after "+strconv.Itoa(seconds)+"s")
+		} else if at, err := http.ParseTime(value); err == nil {
+			details = append(details, "retry-after "+at.UTC().Format(time.RFC3339))
+		}
+	}
+	for _, name := range []string{"X-Request-Id", "Request-Id", "Cf-Ray"} {
+		if value := h.Get(name); requestID.MatchString(value) {
+			details = append(details, "request id "+value)
+			break
+		}
+	}
+	if len(details) == 0 {
+		return ""
+	}
+	return "; " + strings.Join(details, "; ")
+}
+
+// omitImageData copies the payload members that carry inline image bytes.
+func omitImageData(payload Object) Object {
+	out := maps.Clone(payload)
+	if assets, ok := out["assets"].(map[string]any); ok {
+		copied := map[string]any{}
+		for ref, value := range assets {
+			if asset, ok := value.(map[string]any); ok {
+				if data, ok := asset["data_base64"].(string); ok {
+					asset = maps.Clone(asset)
+					asset["data_base64"] = omitted(data)
+					value = asset
+				}
+			}
+			copied[ref] = value
+		}
+		out["assets"] = copied
+	}
+	for _, key := range []string{"state", "questions"} {
+		if value, ok := out[key]; ok {
+			out[key] = omitParts(value)
+		}
+	}
+	return out
+}
+
+func omitParts(value any) any {
+	switch v := value.(type) {
+	case []any:
+		out := make([]any, len(v))
+		for i, item := range v {
+			out[i] = omitParts(item)
+		}
+		return out
+	case map[string]any:
+		if part, ok := v["image_url"].(map[string]any); ok && v["type"] == "image_url" {
+			if url, ok := part["url"].(string); ok && strings.HasPrefix(url, "data:image/") {
+				if prefix, data, found := strings.Cut(url, ";base64,"); found {
+					out := maps.Clone(v)
+					out["image_url"] = Object{"url": prefix + ";base64," + omitted(data)}
+					return out
+				}
+			}
+		}
+		out := make(map[string]any, len(v))
+		for key, item := range v {
+			out[key] = omitParts(item)
+		}
+		return out
+	}
+	return value
+}
+
+func omitted(data string) string {
+	size := base64.StdEncoding.DecodedLen(len(data)) - strings.Count(data[max(0, len(data)-2):], "=")
+	return "[omitted: " + strconv.Itoa(size) + " image bytes]"
 }

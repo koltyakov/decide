@@ -83,7 +83,7 @@ A state override replaces the whole state and retains questions, assets, and ext
 
 Questions in one request cannot consume one another's answers. If routing depends on a prior result, make separate calls and have the calling workflow choose the next step.
 
-`--dry-run` validates locally and previews the payload, upload metadata, and encoded body size without a key or network call. The preview exposes supplied content and inline assets, so keep it out of public logs. A valid preview does not prove context fit or decision accuracy.
+`--dry-run` validates locally and previews the payload, upload metadata, and encoded body size without a key or network call. The preview exposes supplied content and inline assets, so keep it out of public logs. Add `--preview-images summary` to replace inline image bytes with their size. A valid preview does not prove context fit or decision accuracy.
 
 Use `decide capabilities` to inspect locally supported question types, input limits, and enabled image permissions before constructing a request. It requires no key or API call and does not verify live model access. A listed capability is not permission to enable it or send private evidence.
 
@@ -97,11 +97,13 @@ Use only thresholds supplied or authorized by the calling workflow. These comman
 decide noul --instructions 'Does this touch authentication?' --state-file change.diff \
   --at-least 0.9 --output value
 decide systemone triage.json --answer team --is technical --min-confidence 0.85
+decide noul --instructions 'Does this leak a secret?' --state-file change.diff --at-most 0.1
+decide systemone triage.json --policy '[{"answer":"urgent","atLeast":0.9},{"answer":"team","is":["billing","technical"]}]'
 ```
 
-`--at-least` checks Noul probability or Score. `--is` requires a declared Choice key. `--min-confidence` applies to Choice, Score, and Box; missing, null, invalid, or out-of-range confidence fails the gate. Noul probability is not confidence. All rules must pass. Multiple questions require explicit `--answer NAME` for a gate or `--output value`; there is no guessed primary answer.
+`--at-least` and `--at-most` bound Noul probability or Score. `--is` requires a declared Choice key; repeat it to accept any of several keys. `--policy` takes a literal JSON policy or array of policies, each naming its `answer`, to gate several answers at once. `--min-confidence` applies to Choice, Score, and Box; missing, null, invalid, or out-of-range confidence fails the gate. Noul probability is not confidence. All rules must pass. Multiple questions require explicit `--answer NAME` for a gate or `--output value`; there is no guessed primary answer.
 
-JSON with a gate retains native answers and adds `_decide.gate` and `_decide.policy`. A rejected gate is exit 5 with no extra stderr error. A low probability without a gate is a normal exit 0. `--output value` preserves gate exit behavior; Box values stay JSON. `--output raw` omits gate metadata and cannot be combined with acceptance rules.
+JSON with a gate retains native answers and adds `_decide.gate` and `_decide.policy`, or `_decide.gates`, `_decide.policies`, and `_decide.passed` for a policy array. A rejected gate is exit 5 with no extra stderr error. A low probability without a gate is a normal exit 0. `--output value` preserves gate exit behavior; Box values stay JSON. `--output raw` omits gate metadata and cannot be combined with acceptance rules.
 
 ## Image presence and localization
 
@@ -128,7 +130,7 @@ For a native request, save this as `locate.json`:
 decide systemone locate.json --experimental-images --image mug-photo-ref=frame.png
 ```
 
-`systemone --image REFERENCE=PATH` binds that exact reference. Don't also define the same asset inline. Alternatively, put `assets` in the request, mapping the reference to `{"format":"png","data_base64":"..."}` with real standard padded base64 bytes. JSON strings never load local files. A reference must occur in state, instructions, or criteria values, not only object keys.
+`systemone --image REFERENCE=PATH` binds that exact reference. Don't also define the same asset inline. Alternatively, put `assets` in the request, mapping the reference to `{"format":"png","data_base64":"..."}` with real standard padded base64 bytes. JSON strings never load local files. A reference must occur as a whole token in state, instructions, or criteria values, not only in object keys. `photo` doesn't match inside `photography` or `photo-2`. Prefer distinctive references such as UUIDs.
 
 Use PNG/JPEG still images, at most 16 MiB per image and 32 MiB per encoded request. A 280..1568 pixel range on each side meets the CLI's supported dimension checks. Repeated references can expand the request size. The CLI validates images but doesn't resize, crop, or rotate them; prepare the pixels before sending.
 
@@ -143,7 +145,7 @@ Use `decide batch triage.json --states states.jsonl --jobs 4` to reuse questions
 {"subject":"Outage","message":"All checkout requests fail."}
 ```
 
-Results preserve input order as compact JSONL with zero-based `index`, `ok`, and `response` or `error`/`code`. Concurrency defaults to one and is bounded to 1..16. Independent records continue after a record error; nothing is retried. A rejected gate still has `ok: true` and `code: 5`.
+Results preserve input order as compact JSONL with zero-based `index`, `ok`, and `response` or `error`/`code`. Concurrency defaults to one and is bounded to 1..16. Resume with `--from-index N`, or rerun only failed records with `--only-failed previous.jsonl`; indices stay the same. Independent records continue after a record error; nothing is retried. A rejected gate still has `ok: true` and `code: 5`.
 
 Batch supports `--dry-run` and inline recipe assets, not local attachment flags or file paths embedded in rows. It exits 6 if any records failed, otherwise 5 if any gates rejected, otherwise 0. It does not support `--pretty` or value/raw output.
 

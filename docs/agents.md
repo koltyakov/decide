@@ -86,7 +86,7 @@ Decision output schemas describe native `answers` or a `dryRun` preview and reta
 
 `models` makes an explicit authenticated GET on official/custom, DigitalOcean, or OpenRouter Decisions routes and retains the native catalog shape. Unsupported providers fail locally. Discovery does not change provider, endpoint, or saved settings, and catalog access does not prove inference availability for every listed model/account tier.
 
-Optional `policy` accepts `answer`, `atLeast`, `is`, and `minConfidence`. All supplied rules must pass; a multi-question request requires an explicit `answer`. Gate rejection is a valid response with `_decide.gate.passed: false`, not a tool error. Missing confidence fails closed. `dryRun: true` returns a local preflight preview with no API call or key requirement. See [workflow rules](workflows.md).
+Optional `policy` is one object, or an array of up to 64 objects to gate several answers, with `answer`, `atLeast`, `atMost`, `is` (a key or array of keys), and `minConfidence`. Members are matched exactly. All supplied rules of all policies must pass; a multi-question request requires an explicit `answer` in each policy. Gate rejection is a valid response, not a tool error: `_decide.gate.passed: false` for one policy, or `_decide.passed: false` with ordered `_decide.gates` for an array. Missing confidence fails closed. `dryRun: true` returns a local preflight preview with no API call or key requirement. Inline image bytes in the preview are replaced by their size. See [workflow rules](workflows.md).
 
 Inline asset example:
 

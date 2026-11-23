@@ -105,9 +105,9 @@ decide batch examples/triage.json --states examples/states.jsonl --jobs 4
 
 `--dry-run` validates and previews the encoded request without a key or API call. Preview output includes supplied content, so keep it private. It requires JSON output and does not predict model accuracy or server acceptance.
 
-Gates use only thresholds you supply. Exit `5` means a valid decision did not meet the gate, not an API failure. Probability and confidence are different; missing confidence fails a requested confidence gate. Multi-question gates and value output require `--answer NAME`.
+Gates use only thresholds you supply: `--at-least`, `--at-most`, repeatable `--is`, `--min-confidence`, or a `--policy` array to gate several answers. Exit `5` means a valid decision did not meet the gate, not an API failure. Probability and confidence are different; missing confidence fails a requested confidence gate. Multi-question gates and value output require `--answer NAME`.
 
-Batch reuses the recipe's questions for each JSONL state, preserves input order, and reports record failures explicitly. Exit `6` means some records failed. See [workflow controls](docs/workflows.md) for policies, reusable requests, and batch limits.
+Batch validates the recipe once, reuses it for each JSONL state, preserves input order, and reports record failures explicitly. Exit `6` means some records failed; `--from-index` and `--only-failed` resume without changing indices. See [workflow controls](docs/workflows.md) for policies, reusable requests, and batch limits.
 
 ## Build and test
 

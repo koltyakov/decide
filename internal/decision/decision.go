@@ -2,22 +2,125 @@
 package decision
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
+	"maps"
 	"math"
+	"unicode/utf8"
 
 	"github.com/koltyakov/decide/internal/fault"
 	"github.com/koltyakov/decide/internal/jev"
 )
 
+// MaxPolicies bounds the number of gates evaluated for one response.
+const MaxPolicies = 64
+
+// Keys is one or more declared Choice keys. A single key encodes as a string.
+type Keys []string
+
+func (k *Keys) UnmarshalJSON(b []byte) error {
+	var one string
+	if json.Unmarshal(b, &one) == nil {
+		*k = Keys{one}
+		return nil
+	}
+	var many []string
+	if err := json.Unmarshal(b, &many); err != nil || many == nil {
+		return errors.New("is must be a string or an array of strings")
+	}
+	*k = many
+	return nil
+}
+
+func (k Keys) MarshalJSON() ([]byte, error) {
+	if len(k) == 1 {
+		return json.Marshal(k[0])
+	}
+	return json.Marshal([]string(k))
+}
+
 type Policy struct {
 	Answer        string   `json:"answer,omitempty"`
 	AtLeast       *float64 `json:"atLeast,omitempty"`
-	Is            *string  `json:"is,omitempty"`
+	AtMost        *float64 `json:"atMost,omitempty"`
+	Is            Keys     `json:"is,omitempty"`
 	MinConfidence *float64 `json:"minConfidence,omitempty"`
 }
 
-func (p Policy) Active() bool { return p.AtLeast != nil || p.Is != nil || p.MinConfidence != nil }
+func (p Policy) Active() bool {
+	return p.AtLeast != nil || p.AtMost != nil || p.Is != nil || p.MinConfidence != nil
+}
+
+// Policies are independent gates that must all pass. One policy keeps the
+// original _decide.policy/_decide.gate metadata shape.
+type Policies []Policy
+
+func (ps Policies) Active() bool {
+	for _, p := range ps {
+		if p.Active() {
+			return true
+		}
+	}
+	return false
+}
+
+// ParsePolicies strictly decodes a policy object or an array of policy objects.
+// Unknown members are rejected so a misspelled rule can't silently disable a gate.
+func ParsePolicies(b []byte) (Policies, error) {
+	invalid := fault.New(fault.Usage, "policy must be an object, or an array of objects, with answer, atLeast, atMost, is, and minConfidence")
+	b = bytes.TrimSpace(b)
+	if !utf8.Valid(b) || len(b) == 0 {
+		return nil, invalid
+	}
+	decode := func(target any) error {
+		// encoding/json matches names case-insensitively, so check exact member
+		// names first: "atleast" must fail, not become atLeast.
+		var generic any
+		d := json.NewDecoder(bytes.NewReader(b))
+		if err := d.Decode(&generic); err != nil || d.Decode(new(any)) != io.EOF {
+			return invalid
+		}
+		objects, isList := generic.([]any)
+		if !isList {
+			objects = []any{generic}
+		}
+		for _, value := range objects {
+			object, ok := value.(map[string]any)
+			if !ok {
+				return invalid
+			}
+			for key := range object {
+				switch key {
+				case "answer", "atLeast", "atMost", "is", "minConfidence":
+				default:
+					return invalid
+				}
+			}
+		}
+		if json.Unmarshal(b, target) != nil {
+			return invalid
+		}
+		return nil
+	}
+	switch b[0] {
+	case '{':
+		var p Policy
+		if err := decode(&p); err != nil {
+			return nil, err
+		}
+		return Policies{p}, nil
+	case '[':
+		var ps Policies
+		if err := decode(&ps); err != nil {
+			return nil, err
+		}
+		return ps, nil
+	}
+	return nil, invalid
+}
 
 // Select never guesses which answer matters in a multi-question recipe.
 func Select(questions jev.Object, name string) (string, jev.Object, error) {
@@ -33,6 +136,21 @@ func Select(questions jev.Object, name string) (string, jev.Object, error) {
 	return name, q, nil
 }
 
+func (ps Policies) Validate(questions jev.Object) error {
+	if len(ps) > MaxPolicies {
+		return fault.New(fault.Usage, "at most 64 policies can gate one request")
+	}
+	for _, p := range ps {
+		if len(ps) > 1 && !p.Active() {
+			return fault.New(fault.Usage, "each policy in a list needs at least one rule")
+		}
+		if err := p.Validate(questions); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (p Policy) Validate(questions jev.Object) error {
 	if !p.Active() && p.Answer == "" {
 		return nil
@@ -42,25 +160,39 @@ func (p Policy) Validate(questions jev.Object) error {
 		return err
 	}
 	bad := func(message string) error { return fault.New(fault.Usage, message) }
-	if p.AtLeast != nil {
+	for _, bound := range []struct {
+		name  string
+		value *float64
+	}{{"--at-least", p.AtLeast}, {"--at-most", p.AtMost}} {
+		if bound.value == nil {
+			continue
+		}
 		max := 1.0
 		switch q["type"] {
 		case "noul":
 		case "score":
 			max = float64(len(q["criteria"].([]any)) - 1)
 		default:
-			return bad("--at-least applies only to noul and score answers")
+			return bad(bound.name + " applies only to noul and score answers")
 		}
-		if !finite(*p.AtLeast) || *p.AtLeast < 0 || *p.AtLeast > max {
-			return bad("--at-least must be within the answer's probability or score range")
+		if !finite(*bound.value) || *bound.value < 0 || *bound.value > max {
+			return bad(bound.name + " must be within the answer's probability or score range")
 		}
+	}
+	if p.AtLeast != nil && p.AtMost != nil && *p.AtLeast > *p.AtMost {
+		return bad("--at-least must not exceed --at-most")
 	}
 	if p.Is != nil {
 		if q["type"] != "choice" {
 			return bad("--is applies only to choice answers")
 		}
-		if _, ok := q["criteria"].(map[string]any)[*p.Is]; !ok {
-			return bad("--is must name a declared classification option")
+		if len(p.Is) == 0 {
+			return bad("--is must name at least one declared classification option")
+		}
+		for _, key := range p.Is {
+			if _, ok := q["criteria"].(map[string]any)[key]; !ok {
+				return bad("--is must name a declared classification option")
+			}
 		}
 	}
 	if p.MinConfidence != nil {
@@ -91,13 +223,31 @@ type Gate struct {
 type Evaluation struct {
 	Response any
 	Raw      jev.Object
-	Gate     *Gate
+	Gates    []Gate
 }
 
-func (r Evaluation) Rejected() bool { return r.Gate != nil && !r.Gate.Passed }
+func (r Evaluation) Rejected() bool {
+	for _, gate := range r.Gates {
+		if !gate.Passed {
+			return true
+		}
+	}
+	return false
+}
+
+// Mode selects execution or an offline preview.
+type Mode int
+
+const (
+	Execute Mode = iota
+	// Preview validates and encodes without a key or network, showing the full payload.
+	Preview
+	// PreviewSummary is Preview with inline image bytes replaced by their size.
+	PreviewSummary
+)
 
 // Evaluate is the single CLI/MCP workflow, including offline preflight and gating.
-func Evaluate(ctx context.Context, client jev.Client, request jev.Object, options jev.Options, policy Policy, dryRun bool) (*Evaluation, error) {
+func Evaluate(ctx context.Context, client jev.Client, request jev.Object, options jev.Options, policies Policies, mode Mode) (*Evaluation, error) {
 	options, err := client.Resolve(options)
 	if err != nil {
 		return nil, err
@@ -106,12 +256,27 @@ func Evaluate(ctx context.Context, client jev.Client, request jev.Object, option
 	if err != nil {
 		return nil, err
 	}
-	if err = policy.Validate(prepared.Questions); err != nil {
+	return Run(ctx, client, prepared, policies, mode)
+}
+
+// Run validates policies, then previews or executes a prepared request once.
+func Run(ctx context.Context, client jev.Client, prepared *jev.Prepared, policies Policies, mode Mode) (*Evaluation, error) {
+	if err := policies.Validate(prepared.Questions); err != nil {
 		return nil, err
 	}
-	if dryRun {
+	if mode != Execute {
 		preview := prepared.Preview()
-		preview["policy"] = policy
+		if mode == PreviewSummary {
+			preview = prepared.Summary()
+		}
+		if len(policies) > 1 {
+			preview["policies"] = policies
+		} else {
+			preview["policy"] = Policy{}
+			if len(policies) == 1 {
+				preview["policy"] = policies[0]
+			}
+		}
 		return &Evaluation{Response: preview}, nil
 	}
 	raw, err := client.Execute(ctx, prepared)
@@ -120,40 +285,60 @@ func Evaluate(ctx context.Context, client jev.Client, request jev.Object, option
 	}
 	r := &Evaluation{Raw: raw}
 	answers := raw["answers"].(map[string]any)
-	output := jev.Object{}
-	for key, value := range raw {
-		output[key] = value
+	output := maps.Clone(raw)
+	var active Policies
+	for _, policy := range policies {
+		if policy.Active() {
+			active = append(active, policy)
+		}
 	}
-	if policy.Active() {
+	for _, policy := range active {
 		name, spec, _ := Select(prepared.Questions, policy.Answer)
-		answer := answers[name].(map[string]any)
-		value := answer[spec["type"].(string)]
-		gate := &Gate{Answer: name, Passed: true, Checks: []Check{}}
-		add := func(rule string, passed bool, reason string) {
-			gate.Checks = append(gate.Checks, Check{Rule: rule, Passed: passed, Reason: reason})
-			gate.Passed = gate.Passed && passed
-		}
-		if policy.AtLeast != nil {
-			n, ok := number(value)
-			add("atLeast", ok && n >= *policy.AtLeast, "")
-		}
-		if policy.Is != nil {
-			add("is", value == *policy.Is, "")
-		}
-		if policy.MinConfidence != nil {
-			n, ok := number(answer["confidence"])
-			reason := ""
-			if !ok || n < 0 || n > 1 {
-				reason = "confidence_unavailable"
-				ok = false
-			}
-			add("minConfidence", ok && n >= *policy.MinConfidence, reason)
-		}
-		r.Gate = gate
-		output["_decide"] = jev.Object{"gate": gate, "policy": policy}
+		r.Gates = append(r.Gates, policy.gate(name, answers[name].(map[string]any), spec["type"].(string)))
+	}
+	switch {
+	case len(active) == 1:
+		output["_decide"] = jev.Object{"gate": r.Gates[0], "policy": active[0]}
+	case len(active) > 1:
+		output["_decide"] = jev.Object{"gates": r.Gates, "policies": active, "passed": !r.Rejected()}
 	}
 	r.Response = output
 	return r, nil
+}
+
+func (p Policy) gate(name string, answer jev.Object, kind string) Gate {
+	value := answer[kind]
+	gate := Gate{Answer: name, Passed: true, Checks: []Check{}}
+	add := func(rule string, passed bool, reason string) {
+		gate.Checks = append(gate.Checks, Check{Rule: rule, Passed: passed, Reason: reason})
+		gate.Passed = gate.Passed && passed
+	}
+	if p.AtLeast != nil {
+		n, ok := number(value)
+		add("atLeast", ok && n >= *p.AtLeast, "")
+	}
+	if p.AtMost != nil {
+		n, ok := number(value)
+		add("atMost", ok && n <= *p.AtMost, "")
+	}
+	if p.Is != nil {
+		choice, _ := value.(string)
+		matched := false
+		for _, key := range p.Is {
+			matched = matched || choice == key
+		}
+		add("is", matched, "")
+	}
+	if p.MinConfidence != nil {
+		n, ok := number(answer["confidence"])
+		reason := ""
+		if !ok || n < 0 || n > 1 {
+			reason = "confidence_unavailable"
+			ok = false
+		}
+		add("minConfidence", ok && n >= *p.MinConfidence, reason)
+	}
+	return gate
 }
 
 func number(value any) (float64, bool) {

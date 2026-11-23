@@ -91,7 +91,11 @@ func (a *app) decision(kind string) *cobra.Command {
 		if err = jev.Validate(request); err != nil {
 			return err
 		}
-		if err = execution.validate(execution.policy(cmd), request["questions"].(map[string]any)); err != nil {
+		policies, err := execution.policies(cmd)
+		if err != nil {
+			return err
+		}
+		if err = execution.validate(cmd, policies, request["questions"].(map[string]any)); err != nil {
 			return err
 		}
 		attachments, imageState, err := a.images(images, true)

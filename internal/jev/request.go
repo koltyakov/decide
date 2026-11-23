@@ -53,13 +53,23 @@ func Question(kind string, state any, instructions string, criteria any) Object 
 }
 
 func Validate(request Object) error {
-	bad := func(message string) error { return fault.New(fault.Usage, message) }
-	if !content(request["state"], false) {
-		return bad("state must be text, an object, or an array")
-	}
-	if err := validateTree(request["state"], 0); err != nil {
+	if err := validateState(request["state"]); err != nil {
 		return err
 	}
+	return validateRecipe(request)
+}
+
+func validateState(state any) error {
+	if !content(state, false) {
+		return fault.New(fault.Usage, "state must be text, an object, or an array")
+	}
+	return validateTree(state, 0)
+}
+
+// validateRecipe checks everything except state, so recipes can be validated
+// once and reused with per-call states.
+func validateRecipe(request Object) error {
+	bad := func(message string) error { return fault.New(fault.Usage, message) }
 	if model, ok := request["model"]; ok && !nonempty(model) {
 		return bad("model must be a non-empty string")
 	}

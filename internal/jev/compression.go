@@ -2,10 +2,11 @@ package jev
 
 import (
 	"bytes"
-	"compress/gzip"
 	"io"
 	"slices"
+	"sync"
 
+	"github.com/klauspost/compress/gzip"
 	"github.com/klauspost/compress/zstd"
 	"github.com/koltyakov/decide/internal/fault"
 )
@@ -23,6 +24,34 @@ func validateCompression(mode string, capabilities Capabilities) error {
 	return nil
 }
 
+// Encoders are expensive to allocate, so batches reuse them. Each pooled
+// encoder is used by one request at a time and reset before use.
+var (
+	zstdEncoders sync.Pool
+	gzipEncoders sync.Pool
+)
+
+type encoder interface {
+	io.WriteCloser
+	Reset(io.Writer)
+}
+
+func newEncoder(mode string, w io.Writer) (encoder, *sync.Pool, error) {
+	pool := &gzipEncoders
+	if mode == "zstd" {
+		pool = &zstdEncoders
+	}
+	if e, ok := pool.Get().(encoder); ok {
+		e.Reset(w)
+		return e, pool, nil
+	}
+	if mode == "zstd" {
+		e, err := zstd.NewWriter(w, zstd.WithEncoderConcurrency(1), zstd.WithWindowSize(8<<20))
+		return e, pool, err
+	}
+	return gzip.NewWriter(w), pool, nil
+}
+
 // compressBody keeps both the original and encoded body within the API limit.
 func compressBody(body []byte, mode string) ([]byte, error) {
 	if len(body) > MaxBytes {
@@ -32,25 +61,23 @@ func compressBody(body []byte, mode string) ([]byte, error) {
 		return body, nil
 	}
 	var buffer bytes.Buffer
+	buffer.Grow(min(len(body)/2+512, MaxBytes))
 	output := &boundedBody{buffer: &buffer}
-	var encoder io.WriteCloser
-	if mode == "zstd" {
-		writer, err := zstd.NewWriter(output, zstd.WithEncoderConcurrency(1), zstd.WithWindowSize(8<<20))
-		if err != nil {
-			return nil, err
-		}
-		encoder = writer
-	} else {
-		encoder = gzip.NewWriter(output)
+	e, pool, err := newEncoder(mode, output)
+	if err != nil {
+		return nil, err
 	}
-	_, writeErr := encoder.Write(body)
-	closeErr := encoder.Close()
+	_, writeErr := e.Write(body)
+	closeErr := e.Close()
 	if writeErr != nil {
 		return nil, writeErr
 	}
 	if closeErr != nil {
 		return nil, closeErr
 	}
+	// Only a cleanly closed encoder is reused; a failed one is dropped.
+	e.Reset(nil)
+	pool.Put(e)
 	return buffer.Bytes(), nil
 }
 
