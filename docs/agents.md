@@ -16,7 +16,9 @@ The bundled skill teaches CLI scenarios, native payloads, answer interpretation,
 | Antigravity App/IDE | `~/.gemini/config/mcp_config.json` | `.agents/mcp_config.json` | `~/.gemini/config/skills/decide` | `.agents/skills/decide` |
 | Generic agents | `~/.agents/mcp.json` | `.agents/mcp.json` | `~/.agents/skills/decide` | `.agents/skills/decide` |
 
-`XDG_CONFIG_HOME` defaults to `~/.config`. Each skill directory contains `SKILL.md`. For direct JSON config editing, an existing `.jsonc` is preferred over `.json`. OpenCode uses its native CLI when available so it can choose the effective config file. Generic agents configuration may require manual import.
+`XDG_CONFIG_HOME` defaults to `~/.config`. Each skill directory contains `SKILL.md`.
+
+Edits take an advisory lock that waits up to five seconds for a concurrent edit, then write atomically and sync the directory. Before changing an existing MCP config for the first time, Decide saves the original as `FILE.decide-backup` and never overwrites that backup. JSON and JSONC edits keep comments and unrelated settings. Codex TOML is reformatted, so its comments are lost; check the backup. Installed skills carry the `<!-- Managed by decide -->` marker, and Decide refuses to overwrite a skill without it. After upgrading, `decide install-skill --refresh` updates every existing managed copy, globally or with `--project DIR`. It never creates new copies, follows symlinks, or touches unmanaged files. For direct JSON config editing, an existing `.jsonc` is preferred over `.json`. OpenCode uses its native CLI when available so it can choose the effective config file. Generic agents configuration may require manual import.
 
 On Windows, Devin uses `%APPDATA%\devin` for global configuration and skills. Use client `devin` for current Devin Desktop/CLI. Client `windsurf` preserves the older Windsurf global layout; `install-mcp windsurf --project DIR` fails before writing anything because that legacy project MCP path is not documented. Project skill installation still works. Current Cascade and Devin Local use different agents, but their current global MCP file is the Devin path above.
 

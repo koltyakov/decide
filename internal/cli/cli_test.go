@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -160,5 +161,28 @@ func TestProviderConnectionNeverPrintsKey(t *testing.T) {
 		if err != nil || strings.Contains(out+diagnostic, "super-private-key") {
 			t.Fatalf("%v: %s %s %v", args, out, diagnostic, err)
 		}
+	}
+}
+
+func TestVersionJSONAndSkillRefresh(t *testing.T) {
+	_ = testutil.Client(t)
+	out, _, err := execute(t, nil, "version", "--json")
+	var info map[string]any
+	if err != nil || json.Unmarshal([]byte(out), &info) != nil || info["version"] != "test" || info["os"] != runtime.GOOS || info["arch"] != runtime.GOARCH {
+		t.Fatalf("%s %v", out, err)
+	}
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", "")
+	out, _, err = execute(t, nil, "install-skill", "--refresh")
+	if err != nil || !strings.Contains(out, `"refreshed":[]`) {
+		t.Fatalf("%s %v", out, err)
+	}
+	if _, _, err = execute(t, nil, "install-skill", "claude", "--refresh"); fault.Code(err) != fault.Usage {
+		t.Fatal("refresh accepted a client", err)
+	}
+	if _, _, err = execute(t, nil, "install-mcp", "--refresh"); err == nil {
+		t.Fatal("install-mcp accepted --refresh")
 	}
 }

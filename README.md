@@ -41,6 +41,27 @@ go install github.com/koltyakov/decide/cmd/decide@latest
 
 Add Go's bin directory to `PATH`. Installers do not configure credentials or agent integrations.
 
+### Upgrade, verify, and uninstall
+
+Rerun the installer to upgrade. It pins one release, checks the binary's SHA-256 against that release's `checksums.txt`, runs the binary once, and then replaces the old one. On Apple silicon it installs the native arm64 build even from a Rosetta shell. On Windows it moves a running `decide.exe`, such as an MCP server, aside rather than failing. It preserves the user `PATH` registry type and updates the current session. Installed skills are not changed automatically; refresh the ones Decide manages:
+
+```sh
+decide install-skill --refresh
+decide version --json
+```
+
+`--refresh` rewrites existing skill files that carry Decide's managed marker, for every client, globally or with `--project DIR`. It never creates new integrations, follows symlinks, or touches unmanaged files. `version --json` reports the version, OS, architecture, and executable SHA-256 for diagnosing an install.
+
+Installers verify checksums, not signatures. Release CI signs `checksums.txt` and `decide-manifest.json` with Sigstore. To verify a release by hand before trusting its checksums:
+
+```sh
+cosign verify-blob --bundle checksums.txt.sigstore.json \
+  --certificate-identity-regexp '^https://github.com/koltyakov/decide/\.github/workflows/release\.yml@' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com checksums.txt
+```
+
+To uninstall, run `scripts/uninstall.sh` or `scripts/uninstall.ps1` (the PowerShell script also removes the `PATH` entry), or `make uninstall` for a `go install` build. Uninstalling keeps saved credentials, MCP entries, and skills; remove those by hand.
+
 ## Connect a provider
 
 ```sh

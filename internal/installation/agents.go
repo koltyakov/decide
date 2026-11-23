@@ -98,6 +98,12 @@ func Locations(client, home, project string) (Paths, error) {
 	return paths, nil
 }
 
+// Clients lists every supported client in documentation order.
+var Clients = []string{"opencode", "claude", "cursor", "copilot", "codex", "devin", "windsurf", "antigravity", "agents"}
+
+// ManagedMarker identifies skill files that decide owns and may overwrite.
+const ManagedMarker = "<!-- Managed by decide -->"
+
 type Options struct {
 	Client, Home, Project, Binary string
 	Args                          []string
@@ -146,23 +152,68 @@ func Install(ctx context.Context, o Options) (Paths, error) {
 		}
 	}
 	if o.Skill {
-		unlock, err := store.Lock(paths.Skill)
-		if err != nil {
-			return paths, err
-		}
-		defer unlock()
-		old, err := os.ReadFile(paths.Skill)
-		if err != nil && !os.IsNotExist(err) {
-			return paths, err
-		}
-		if err == nil && !bytes.Contains(old, []byte("<!-- Managed by decide -->")) {
-			return paths, fmt.Errorf("refusing to overwrite unmanaged skill: %s", paths.Skill)
-		}
-		if err = store.Write(paths.Skill, skills.Decide); err != nil {
+		if _, err = writeSkill(paths.Skill, false); err != nil {
 			return paths, err
 		}
 	}
 	return paths, nil
+}
+
+// writeSkill installs the embedded skill unless an unmanaged file exists. With
+// existingOnly, a missing, unmanaged, or non-regular file is left untouched
+// instead. It reports whether the file changed.
+func writeSkill(path string, existingOnly bool) (bool, error) {
+	if existingOnly {
+		// Don't adopt symlinked or special files during discovery.
+		if info, err := os.Lstat(path); err != nil || !info.Mode().IsRegular() {
+			return false, nil
+		}
+	}
+	unlock, err := store.Lock(path)
+	if err != nil {
+		return false, err
+	}
+	defer unlock()
+	old, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		return false, err
+	}
+	if existingOnly && (err != nil || !bytes.Contains(old, []byte(ManagedMarker))) {
+		return false, nil
+	}
+	if err == nil && !bytes.Contains(old, []byte(ManagedMarker)) {
+		return false, fmt.Errorf("refusing to overwrite unmanaged skill: %s", path)
+	}
+	if err == nil && bytes.Equal(old, skills.Decide) {
+		return false, nil
+	}
+	return true, store.Write(path, skills.Decide)
+}
+
+// RefreshSkills rewrites previously installed, decide-managed skill files for
+// every client, globally or under project. It never creates new skills, so an
+// upgrade updates existing integrations without adding new ones.
+func RefreshSkills(home, project string) ([]string, error) {
+	refreshed := []string{}
+	seen := map[string]bool{}
+	for _, client := range Clients {
+		paths, err := Locations(client, home, project)
+		if err != nil {
+			return refreshed, err
+		}
+		if seen[paths.Skill] {
+			continue
+		}
+		seen[paths.Skill] = true
+		changed, err := writeSkill(paths.Skill, true)
+		if err != nil {
+			return refreshed, err
+		}
+		if changed {
+			refreshed = append(refreshed, paths.Skill)
+		}
+	}
+	return refreshed, nil
 }
 
 func mergeMCP(paths Paths, entry map[string]any) (string, error) {

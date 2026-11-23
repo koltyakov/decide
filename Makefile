@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help tidy deps deps-update deps-check fmt fmt-check lint vet test test-race check cov bench build install bundle build-all release-local release-check vuln ci
+.PHONY: help tidy deps deps-update deps-check fmt fmt-check lint vet test test-race check cov bench build install uninstall bundle build-all release-local release-check vuln ci
 
 GO ?= go
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
@@ -23,6 +23,7 @@ help:
 	@echo "make check                Vet and race tests"
 	@echo "make cov / bench          Generate coverage HTML / run benchmarks"
 	@echo "make build / install      Build bin/decide / install decide to GOBIN"
+	@echo "make uninstall            Remove decide from GOBIN; keeps credentials and integrations"
 	@echo "make bundle / build-all   Build six platform binaries and checksums"
 	@echo "make release-local        Build and verify a release bundle"
 	@echo "make release-check        Verify the existing release bundle"
@@ -76,6 +77,10 @@ build:
 
 install:
 	CGO_ENABLED=0 $(GO) install -trimpath -ldflags '-s -w -X main.version=$(VERSION)' ./cmd/decide
+
+uninstall:
+	@bin="$$($(GO) env GOBIN)"; [ -n "$$bin" ] || bin="$$($(GO) env GOPATH)/bin"; \
+	rm -f "$$bin/decide" "$$bin/decide.exe"; echo "Removed decide from $$bin"
 
 bundle:
 	$(GO) run ./cmd/decide-bundle --out "$(DIST_DIR)" --platforms "$(PLATFORMS)" --version "$(VERSION)"

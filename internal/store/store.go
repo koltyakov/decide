@@ -56,5 +56,11 @@ func Write(path string, data []byte) error {
 	if closeErr != nil {
 		return closeErr
 	}
-	return os.Rename(f.Name(), path)
+	if err = os.Rename(f.Name(), path); err != nil {
+		return err
+	}
+	// The new contents are already visible; a failed directory sync only
+	// weakens crash durability, so it does not turn a completed write into an error.
+	_ = syncDirectory(filepath.Dir(path))
+	return nil
 }

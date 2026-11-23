@@ -53,4 +53,4 @@ Batch reads JSONL states into windows of at most `jobs` records, with `jobs` bou
 - Probability and confidence are distinct. A gate is not permission to perform a downstream action.
 - Build and tests don't install agent configuration, services, or credentials.
 
-Build/release conventions follow Control: six CGO-free platform binaries, manifests, checksums, race tests, and pinned checks. Release CI signs metadata with Sigstore. Install scripts verify checksums and install `decide` or `decide.exe`.
+Build/release conventions follow Control: six CGO-free platform binaries, manifests, checksums, race tests, and pinned checks. Release CI signs metadata with Sigstore and verifies the signatures before publishing. Install scripts resolve one release from its manifest, verify checksums, run the binary once, and then install `decide` or `decide.exe`. They don't verify signatures. Uninstall scripts remove the binary and, on Windows, the `PATH` entry.

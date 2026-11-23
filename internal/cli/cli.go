@@ -2,9 +2,13 @@
 package cli
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"time"
 
 	"github.com/koltyakov/decide/internal/agent"
@@ -54,7 +58,7 @@ func New(version string, in io.Reader, out, diagnostic io.Writer) *cobra.Command
 	for _, kind := range []string{"noul", "choice", "score", "box"} {
 		root.AddCommand(a.decision(kind))
 	}
-	root.AddCommand(a.systemOne(), a.batch(), a.providers(), a.install("install-mcp"), a.install("install-skill"))
+	root.AddCommand(a.systemOne(), a.batch(), a.providers(), a.install("install-mcp"), a.install("install-skill"), a.versionCommand())
 	root.AddCommand(&cobra.Command{
 		Use: "models", Short: "List the selected provider's native model catalog", Args: noArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -137,4 +141,40 @@ func (a *app) print(value any) error {
 		e.SetIndent("", "  ")
 	}
 	return e.Encode(value)
+}
+
+// versionCommand reports build and platform facts for diagnosing installs,
+// such as an x86-64 binary running under Rosetta on Apple silicon.
+func (a *app) versionCommand() *cobra.Command {
+	var asJSON bool
+	cmd := &cobra.Command{Use: "version", Short: "Print the version, platform, and executable checksum", Args: noArgs, RunE: func(_ *cobra.Command, _ []string) error {
+		info := map[string]any{"version": a.version, "os": runtime.GOOS, "arch": runtime.GOARCH, "go": runtime.Version()}
+		if sum, err := executableSHA256(); err == nil {
+			info["sha256"] = sum
+		}
+		if asJSON {
+			return a.print(info)
+		}
+		_, err := fmt.Fprintf(a.out, "decide %s %s/%s\n", a.version, runtime.GOOS, runtime.GOARCH)
+		return err
+	}}
+	cmd.Flags().BoolVar(&asJSON, "json", false, "print JSON with platform and the executable's SHA-256")
+	return cmd
+}
+
+func executableSHA256() (string, error) {
+	path, err := os.Executable()
+	if err != nil {
+		return "", err
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = f.Close() }()
+	h := sha256.New()
+	if _, err = io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }

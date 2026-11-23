@@ -3,6 +3,7 @@ package cli
 import (
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/koltyakov/decide/internal/fault"
 	"github.com/koltyakov/decide/internal/installation"
@@ -11,11 +12,18 @@ import (
 
 func (a *app) install(command string) *cobra.Command {
 	var project string
+	var refresh bool
 	cmd := &cobra.Command{
 		Use: command + " CLIENT", Short: "Install agent integration globally or with --project DIR",
 		Args: func(_ *cobra.Command, args []string) error {
+			if refresh {
+				if len(args) != 0 {
+					return fault.New(fault.Usage, "--refresh updates every client's managed skill; omit CLIENT")
+				}
+				return nil
+			}
 			if len(args) != 1 {
-				return fault.New(fault.Usage, "provide a client: opencode, claude, cursor, copilot, codex, devin, windsurf, antigravity, or agents")
+				return fault.New(fault.Usage, "provide a client: "+strings.Join(installation.Clients, ", "))
 			}
 			return nil
 		},
@@ -32,6 +40,13 @@ func (a *app) install(command string) *cobra.Command {
 				if info, err := os.Stat(project); err != nil || !info.IsDir() {
 					return fault.New(fault.Usage, "project must be an existing directory")
 				}
+			}
+			if refresh {
+				refreshed, err := installation.RefreshSkills(home, project)
+				if err != nil {
+					return err
+				}
+				return a.print(map[string]any{"ok": true, "refreshed": refreshed})
 			}
 			binary, err := os.Executable()
 			if err != nil {
@@ -76,5 +91,9 @@ func (a *app) install(command string) *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&project, "project", "", "project directory; omitted installs globally")
+	if command == "install-skill" {
+		cmd.Use = command + " CLIENT | --refresh"
+		cmd.Flags().BoolVar(&refresh, "refresh", false, "update existing decide-managed skills for every client after an upgrade; never creates new ones")
+	}
 	return cmd
 }
