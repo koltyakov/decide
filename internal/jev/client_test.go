@@ -116,6 +116,23 @@ func TestResponsesFailClosed(t *testing.T) {
 	}
 }
 
+func TestVercelRejectsContradictoryAnswerTypes(t *testing.T) {
+	request := jev.Question("score", "state", "Rate it", []any{"low", "high"})
+	for _, kind := range []string{"choice", "boolean"} {
+		t.Run(kind, func(t *testing.T) {
+			client := testutil.Client(t)
+			s := testutil.API(t, func(w http.ResponseWriter, _ *http.Request) {
+				answer := jev.Object{"type": kind, "score": 1, "probability": 0.8}
+				testutil.Reply(t, w, jev.Object{"answers": jev.Object{"answer": answer}})
+			})
+			result, err := client.Evaluate(t.Context(), request, jev.Options{Provider: "vercel", Endpoint: s.URL})
+			if err == nil || fault.Code(err) != fault.Failure || result != nil {
+				t.Fatalf("score with type %q: result=%v err=%v", kind, result, err)
+			}
+		})
+	}
+}
+
 func TestTimeoutAndCancellation(t *testing.T) {
 	client := testutil.Client(t)
 	client.Timeout = 20 * time.Millisecond

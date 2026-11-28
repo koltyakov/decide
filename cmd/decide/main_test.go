@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
@@ -26,6 +28,18 @@ func TestExecutableCLIAndStdio(t *testing.T) {
 	build := exec.Command("go", "build", "-o", binary, ".")
 	if output, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build: %s %v", output, err)
+	}
+	sources := map[string]stdinSource{"pipe": pipeStdin}
+	if socketStdin != nil {
+		sources["socket"] = socketStdin
+	}
+	for name, connect := range sources {
+		t.Run("interrupt batch with "+name+" stdin open", func(t *testing.T) {
+			if runtime.GOOS == "windows" {
+				t.Skip("os.Process.Signal does not support Interrupt on Windows")
+			}
+			interruptBatch(t, binary, connect)
+		})
 	}
 	for _, args := range [][]string{{"noul"}, {"unknown-command"}, {"systemone", "-", "--output", "invalid"}} {
 		cmd := exec.Command(binary, args...)
@@ -90,5 +104,53 @@ func TestExecutableCLIAndStdio(t *testing.T) {
 	}
 	if strings.Contains(stderr.String(), "test-secret") {
 		t.Error("credential leaked to stderr")
+	}
+}
+
+// stdinSource connects a child's stdin and returns the parent's writer.
+type stdinSource func(t *testing.T, cmd *exec.Cmd) io.WriteCloser
+
+func pipeStdin(t *testing.T, cmd *exec.Cmd) io.WriteCloser {
+	input, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return input
+}
+
+// interruptBatch checks that SIGINT stops a batch whose stdin stays open
+// without more data, after it has emitted a row.
+func interruptBatch(t *testing.T, binary string, connect stdinSource) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, binary, "batch", "../../examples/triage.json", "--jobs", "2", "--dry-run")
+	input := connect(t, cmd)
+	output, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = input.Close()
+		if cmd.ProcessState == nil {
+			cancel()
+			_ = cmd.Wait()
+		}
+	}()
+	if _, err := io.WriteString(input, "\"first\"\n"); err != nil {
+		t.Fatal(err)
+	}
+	var row struct{ OK bool }
+	if err := json.NewDecoder(output).Decode(&row); err != nil || !row.OK {
+		t.Fatalf("first row: %+v, err=%v", row, err)
+	}
+	if err := cmd.Process.Signal(os.Interrupt); err != nil {
+		t.Fatal(err)
+	}
+	exit, ok := cmd.Wait().(*exec.ExitError)
+	if !ok || exit.ExitCode() != 130 {
+		t.Fatalf("batch interrupt with stdin open: %v", exit)
 	}
 }

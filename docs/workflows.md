@@ -40,7 +40,7 @@ decide systemone examples/triage.json \
 
 Confidence is not probability. Noul has no confidence gate; use its probability. A confidence gate fails when the value is missing, null, non-numeric, non-finite, or outside 0 to 1. This remains true for `minConfidence: 0`.
 
-Thresholds must fit the question's range. A score with three levels supports 0 to 2; a Noul supports 0 to 1. An unknown Choice key, a missing question selection, or a policy for the wrong primitive fails before an API call.
+Thresholds must fit the question's range. A score with three levels supports 0 to 2; a Noul supports 0 to 1. Omit policy members you don't use. An explicit `null`, an unknown Choice key, a missing question selection, or a policy for the wrong primitive fails before an API call.
 
 The native response is unchanged except for explicit client metadata when a gate is requested. One policy adds `_decide.policy` and `_decide.gate`:
 
@@ -98,7 +98,7 @@ The default `--jobs 1` makes request spending serial and explicit. Values up to 
 
 The recipe is validated once, before any state is read: its questions, provider rules, image opt-in, and inline assets, with each inline image decoded once. A recipe error is a usage error (exit 2), not one failure per record. Each record then validates only its state and the asset references the recipe's questions don't already contain. A stored key is read once per batch. If it is missing, every record still reports the authentication failure.
 
-Records keep their original zero-based `index` when resuming. `--from-index N` skips earlier non-empty records. `--only-failed FILE` reads a prior batch output file and reruns only records with `ok: false`. Rejected gates are valid results and are not rerun. Both flags are explicit choices; Decide never reruns records on its own. Billing for interrupted or failed requests depends on the provider.
+Records keep their original zero-based `index` when resuming. `--from-index N` skips earlier non-empty records. `--only-failed FILE` reads a prior batch output file and reruns only records with `ok: false`. If the states input ends before any of the selected indices, Decide emits the rows it processed, reports the missing indices, and exits 2. Indices below `--from-index` are excluded from this check. Rejected gates are valid results and are not rerun. Billing for interrupted or failed requests depends on the provider.
 
 Cancellation stops starting records and reaches in-flight HTTP requests. Completed calls can still be billed; no interrupted request is automatically retried. An unreadable or oversized input line stops scanning with an input error, after any already processed rows.
 

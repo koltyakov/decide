@@ -281,14 +281,15 @@ func (c Client) Execute(ctx context.Context, p *Prepared) (Object, error) {
 			return nil, fault.New(fault.Failure, "API response is missing a requested answer")
 		}
 		if p.options.Provider == "vercel" && answer["type"] == "boolean" {
+			answer["type"] = "noul"
 			answer["noul"] = answer["probability"]
 			delete(answer, "probability")
 		}
-		if p.options.Provider == "vercel" {
-			delete(answer, "type")
-		}
 		if err := validateAnswer(answer, spec.(map[string]any)); err != nil {
 			return nil, err
+		}
+		if p.options.Provider == "vercel" {
+			delete(answer, "type")
 		}
 	}
 	return result, nil

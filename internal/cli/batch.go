@@ -7,7 +7,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"os"
+	"slices"
 	"sync"
 
 	"github.com/koltyakov/decide/internal/decision"
@@ -24,19 +26,10 @@ type batchResult struct {
 	Code     int    `json:"code,omitempty"`
 }
 
-func closed(done <-chan struct{}) bool {
-	select {
-	case <-done:
-		return true
-	default:
-		return false
-	}
-}
-
-// batchSlot is one record in flight or awaiting in-order output.
-type batchSlot struct {
-	done chan struct{}
-	row  batchResult
+type batchJob struct {
+	index  int
+	state  []byte
+	result chan batchResult
 }
 
 func (a *app) batch() *cobra.Command {
@@ -48,7 +41,7 @@ func (a *app) batch() *cobra.Command {
 	cmd.Flags().StringVar(&states, "states", "-", "JSONL states file or - for stdin; each line is a native state value")
 	cmd.Flags().IntVar(&jobs, "jobs", 1, "maximum records in flight, 1 to 16; output stays in input order")
 	cmd.Flags().IntVar(&fromIndex, "from-index", 0, "skip records before this zero-based index, to resume a batch")
-	cmd.Flags().StringVar(&onlyFailed, "only-failed", "", "prior batch JSONL output file; rerun only its failed record indices")
+	cmd.Flags().StringVar(&onlyFailed, "only-failed", "", "prior batch JSONL output file; rerun its selected failures and report indices missing from --states")
 	cmd.RunE = func(cmd *cobra.Command, args []string) error {
 		if args[0] == "-" {
 			return fault.New(fault.Usage, "batch requires a recipe file; stdin is reserved for JSONL states")
@@ -90,13 +83,10 @@ func (a *app) batch() *cobra.Command {
 		if err = flags.validate(cmd, policies, recipe.Questions()); err != nil {
 			return err
 		}
-		selected, last := map[int]bool(nil), -1
+		var selected map[int]bool
 		if onlyFailed != "" {
-			if selected, err = failedIndices(onlyFailed); err != nil {
+			if selected, err = failedIndices(onlyFailed, fromIndex); err != nil {
 				return err
-			}
-			for index := range selected {
-				last = max(last, index)
 			}
 		}
 		mode := flags.mode()
@@ -107,77 +97,61 @@ func (a *app) batch() *cobra.Command {
 		if err != nil {
 			return err
 		}
-		defer func() { _ = reader.Close() }()
-		ctx := cmd.Context()
-		stopClose := context.AfterFunc(ctx, func() { _ = reader.Close() })
+		ctx, cancel := context.WithCancel(cmd.Context())
+		closeReader := sync.OnceFunc(func() { _ = reader.Close() })
+		stopClose := context.AfterFunc(ctx, closeReader)
 		defer stopClose()
-		scanner := bufio.NewScanner(reader)
-		scanner.Buffer(make([]byte, 64<<10), jev.MaxBytes+1)
+		var wg sync.WaitGroup
+		defer func() {
+			cancel()
+			closeReader()
+			wg.Wait()
+		}()
+
+		work := make(chan batchJob)
+		for range jobs {
+			wg.Go(func() {
+				for job := range work {
+					if ctx.Err() != nil {
+						close(job.result)
+						continue
+					}
+					job.result <- batchRecord(ctx, client, recipe, policies, mode, job.index, job.state)
+				}
+			})
+		}
+		// The writer holds one result channel; the queue holds the rest of the window.
+		ordered := make(chan chan batchResult, 2*jobs-1)
+		var inputErr error
+		wg.Go(func() {
+			defer close(ordered)
+			defer close(work)
+			inputErr = queueBatch(ctx, reader, fromIndex, selected, work, ordered)
+		})
 		encoder := json.NewEncoder(a.out)
 		encoder.SetEscapeHTML(false)
-		var wg sync.WaitGroup
-		defer wg.Wait()
-		// At most --jobs requests are in flight, and at most twice that many
-		// records are held for in-order output. A slow record delays its own
-		// output, but later records keep starting until the buffer is full.
-		limit := 2 * jobs
-		queue := make([]*batchSlot, 0, limit)
-		finished := make(chan struct{}, limit)
-		index, processed, failures, inFlight, rejected, eof := 0, 0, 0, 0, false, false
-		for {
-			for !eof && len(queue) < limit && inFlight < jobs && ctx.Err() == nil {
-				if selected != nil && index > last {
-					eof = true // Every selected record has been read.
-					break
-				}
-				if !scanner.Scan() {
-					eof = true
-					break
-				}
-				if len(bytes.TrimSpace(scanner.Bytes())) == 0 {
-					continue
-				}
-				i := index
-				index++
-				if i < fromIndex || (selected != nil && !selected[i]) {
-					continue
-				}
-				line := bytes.Clone(scanner.Bytes())
-				slot := &batchSlot{done: make(chan struct{})}
-				queue = append(queue, slot)
-				inFlight++
-				wg.Go(func() {
-					slot.row = batchRecord(ctx, client, recipe, policies, mode, i, line)
-					close(slot.done)
-					finished <- struct{}{}
-				})
+		processed, failures, rejected := 0, 0, false
+		for result := range ordered {
+			row, started := <-result
+			if !started {
+				continue
 			}
-			for len(queue) > 0 && closed(queue[0].done) {
-				row := queue[0].row
-				queue[0] = nil
-				queue = queue[1:]
-				processed++
-				if !row.OK {
-					failures++
-				}
-				if row.Code == fault.Rejected {
-					rejected = true
-				}
-				if err = encoder.Encode(row); err != nil {
-					return err
-				}
+			if err = encoder.Encode(row); err != nil {
+				return err
 			}
-			if len(queue) == 0 && (eof || ctx.Err() != nil) {
-				break
+			processed++
+			if !row.OK {
+				failures++
 			}
-			<-finished
-			inFlight--
+			if row.Code == fault.Rejected {
+				rejected = true
+			}
 		}
 		if err = ctx.Err(); err != nil {
 			return err
 		}
-		if err = scanner.Err(); err != nil {
-			return fault.New(fault.Usage, "cannot read JSONL states; each line must be at most 32 MiB")
+		if inputErr != nil {
+			return inputErr
 		}
 		if failures > 0 {
 			return fault.New(fault.Batch, fmt.Sprintf("batch completed with %d failed records out of %d; requests were not retried", failures, processed))
@@ -188,6 +162,43 @@ func (a *app) batch() *cobra.Command {
 		return nil
 	}
 	return cmd
+}
+
+func queueBatch(ctx context.Context, reader io.Reader, fromIndex int, selected map[int]bool, work chan<- batchJob, ordered chan<- chan batchResult) error {
+	reader, err := batchStateReader(ctx, reader)
+	if err != nil {
+		return err
+	}
+	scanner := bufio.NewScanner(reader)
+	scanner.Buffer(make([]byte, 64<<10), jev.MaxBytes+1)
+	index := 0
+	for ctx.Err() == nil && (selected == nil || len(selected) > 0) && scanner.Scan() {
+		if len(bytes.TrimSpace(scanner.Bytes())) == 0 {
+			continue
+		}
+		i := index
+		index++
+		if i < fromIndex || (selected != nil && !selected[i]) {
+			continue
+		}
+		// Reserve output space before dispatch. A worker can finish even if the
+		// writer is waiting for an earlier row or has returned a write error.
+		result := make(chan batchResult, 1)
+		select {
+		case ordered <- result:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		work <- batchJob{index: i, state: bytes.Clone(scanner.Bytes()), result: result}
+		delete(selected, i)
+	}
+	if scanner.Err() != nil {
+		return fault.New(fault.Usage, "cannot read JSONL states; each line must be at most 32 MiB")
+	}
+	if len(selected) > 0 {
+		return fault.New(fault.Usage, fmt.Sprintf("states input is missing --only-failed indices %v", slices.Sorted(maps.Keys(selected))))
+	}
+	return nil
 }
 
 func batchRecord(ctx context.Context, client jev.Client, recipe *jev.Recipe, policies decision.Policies, mode decision.Mode, index int, line []byte) batchResult {
@@ -213,7 +224,7 @@ func batchRecord(ctx context.Context, client jev.Client, recipe *jev.Recipe, pol
 
 // failedIndices reads prior batch output and returns the indices of failed
 // records. Rejected gates are valid results and are not selected.
-func failedIndices(path string) (map[int]bool, error) {
+func failedIndices(path string, fromIndex int) (map[int]bool, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, fault.New(fault.Usage, "cannot open --only-failed file")
@@ -232,7 +243,7 @@ func failedIndices(path string) (map[int]bool, error) {
 		} else if err != nil || row.Index == nil || row.OK == nil || *row.Index < 0 {
 			return nil, invalid
 		}
-		if !*row.OK {
+		if !*row.OK && *row.Index >= fromIndex {
 			failed[*row.Index] = true
 		}
 	}

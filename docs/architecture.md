@@ -42,7 +42,7 @@ Only explicit CLI file flags read paths. Raw JSON and MCP arguments never trigge
 
 File attachments use multipart with JSON first on official/custom, inline base64 on AI/ML API, and inline `image_url` parts on OpenRouter. OpenRouter's adapter replaces references in state/instructions/criteria because that API otherwise ignores the assets map. Direct native OpenRouter parts are validated too. Reference expansion has a bounded safety budget before encoding; actual body sizes are checked afterward. Images are validated for each provider's dimensions, animation, bytes, references, and opt-in requirements. Bodies are buffered rather than uploaded by unowned pipe goroutines. Pixels are not resized or re-encoded. Server-side image processing and token limits can still reject a locally valid request.
 
-Batch reads JSONL states into windows of at most `jobs` records, with `jobs` bounded to 1..16. Independent requests run concurrently within a window. All results are emitted in input order before the next window starts. This bounds pending work and reorder storage without buffering the input stream. Errors are record results, not invented decisions. Cancellation reaches HTTP and prevents later windows from starting.
+Batch reads JSONL states independently of its output writer. Up to `jobs` workers process records concurrently. The writer receives their result channels in input order, so it can emit a completed row even while the reader waits for more input. The [batch workflow](workflows.md#jsonl-batches) describes the window bounds, resume behavior, and exit codes.
 
 ## Trust and release boundaries
 

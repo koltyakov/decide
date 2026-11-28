@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"os"
@@ -67,6 +68,24 @@ func TestRecipeStateReplacementAndValueSelection(t *testing.T) {
 	}
 }
 
+func TestNullPolicyMembersFailBeforeProviderCall(t *testing.T) {
+	_ = testutil.Client(t)
+	var calls atomic.Int32
+	s := testutil.API(t, func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		testutil.Reply(t, w, jev.Object{"answers": jev.Object{"answer": jev.Object{"noul": 0.8}}})
+	})
+	for _, policy := range []string{
+		`{"atLeast":null}`, `{"atLeast":0.5,"atMost":null}`, `[{"minConfidence":null}]`,
+		`{"is":null}`, `{"answer":null,"atLeast":0.5}`,
+	} {
+		out, _, err := execute(t, nil, "noul", "--instructions", "Q?", "--state", "x", "--policy", policy, "--endpoint", s.URL)
+		if err == nil || fault.Code(err) != fault.Usage || out != "" || calls.Load() != 0 {
+			t.Fatalf("policy %s: err=%v stdout=%q calls=%d", policy, err, out, calls.Load())
+		}
+	}
+}
+
 func TestBatchBoundedConcurrencyOrderedResultsAndErrors(t *testing.T) {
 	_ = testutil.Client(t)
 	recipe := writeRecipe(t, `{"questions":{"urgent":{"type":"noul","instructions":"Urgent?"}}}`)
@@ -122,6 +141,66 @@ func TestBatchBoundedConcurrencyOrderedResultsAndErrors(t *testing.T) {
 	}
 }
 
+func TestBatchEmitsResultsBeforeMoreInput(t *testing.T) {
+	_ = testutil.Client(t)
+	recipe := writeRecipe(t, `{"questions":{"a":{"type":"noul"}}}`)
+	input, send := io.Pipe()
+	output, write := io.Pipe()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	cmd := New("test", input, write, io.Discard)
+	cmd.SetArgs([]string{"batch", recipe, "--jobs", "2", "--dry-run"})
+	done := make(chan error, 1)
+	go func() {
+		err := cmd.ExecuteContext(ctx)
+		_ = write.CloseWithError(err)
+		done <- err
+	}()
+	defer func() {
+		_ = send.Close()
+		_ = output.Close()
+		if err := <-done; err != nil {
+			t.Error(err)
+		}
+		cancel()
+	}()
+
+	decoder := json.NewDecoder(output)
+	for i, state := range []string{"\"first\"\n", "\"second\"\n"} {
+		if _, err := io.WriteString(send, state); err != nil {
+			t.Fatal(err)
+		}
+		var row batchResult
+		if err := decoder.Decode(&row); err != nil || !row.OK || row.Index != i {
+			t.Fatalf("waiting for row %d with stdin open: row=%+v err=%v", i, row, err)
+		}
+	}
+}
+
+func TestBatchOutputErrorUnblocksInput(t *testing.T) {
+	_ = testutil.Client(t)
+	recipe := writeRecipe(t, `{"questions":{"a":{"type":"noul"}}}`)
+	input, send := io.Pipe()
+	defer func() { _ = send.Close() }()
+	output, write := io.Pipe()
+	_ = output.Close()
+	defer func() { _ = write.Close() }()
+	cmd := New("test", input, write, io.Discard)
+	cmd.SetArgs([]string{"batch", recipe, "--jobs", "2", "--dry-run"})
+	done := make(chan error, 1)
+	go func() { done <- cmd.ExecuteContext(t.Context()) }()
+	if _, err := io.WriteString(send, "\"first\"\n"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, io.ErrClosedPipe) {
+			t.Fatalf("got %v, want the output pipe error", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("batch waited for more input after its output pipe closed")
+	}
+}
+
 func TestBatchCancellationStopsLaterWindows(t *testing.T) {
 	_ = testutil.Client(t)
 	recipe := writeRecipe(t, `{"questions":{"a":{"type":"noul"}}}`)
@@ -139,6 +218,9 @@ func TestBatchCancellationStopsLaterWindows(t *testing.T) {
 	cmd.SetArgs([]string{"batch", recipe, "--endpoint", s.URL})
 	if err := cmd.ExecuteContext(ctx); err == nil || calls.Load() != 1 {
 		t.Fatalf("%v calls=%d", err, calls.Load())
+	}
+	if result := rows(t, out.String()); len(result) != 1 || result[0].Index != 0 {
+		t.Fatalf("unexpected rows after cancellation: %s", out.String())
 	}
 }
 

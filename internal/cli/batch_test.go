@@ -95,6 +95,19 @@ func TestBatchResumeAndOnlyFailed(t *testing.T) {
 	if err != nil || len(result) != 2 || result[0].Index != 1 || result[1].Index != 3 || strings.Join(seen, ",") != "1,3" {
 		t.Fatalf("only-failed reran the wrong records: %v %s %v", err, out, seen)
 	}
+	out, _, err = execute(t, []byte("\"0\"\n\n\"1\"\n"), "batch", recipe, "--only-failed", prior, "--dry-run")
+	result = rows(t, out)
+	if err == nil || fault.Code(err) != fault.Usage || !strings.Contains(err.Error(), "indices [3]") || len(result) != 1 || result[0].Index != 1 || !result[0].OK {
+		t.Fatalf("truncated resume lost the completed row or missing index: %v %s", err, out)
+	}
+	out, _, err = execute(t, nil, "batch", recipe, "--only-failed", prior, "--from-index", "2", "--dry-run")
+	if err == nil || fault.Code(err) != fault.Usage || !strings.Contains(err.Error(), "indices [3]") || out != "" {
+		t.Fatalf("missing indices should exclude those below --from-index: %v %s", err, out)
+	}
+	out, _, err = execute(t, nil, "batch", recipe, "--only-failed", prior, "--from-index", "4", "--dry-run")
+	if err != nil || out != "" {
+		t.Fatalf("empty selection should succeed: %v %s", err, out)
+	}
 	if err = os.WriteFile(prior, []byte(`{"ok":false}`), 0600); err != nil {
 		t.Fatal(err)
 	}

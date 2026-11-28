@@ -92,9 +92,12 @@ func ParsePolicies(b []byte) (Policies, error) {
 			if !ok {
 				return invalid
 			}
-			for key := range object {
+			for key, value := range object {
 				switch key {
 				case "answer", "atLeast", "atMost", "is", "minConfidence":
+					if value == nil {
+						return fault.New(fault.Usage, "policy member "+key+" cannot be null")
+					}
 				default:
 					return invalid
 				}
